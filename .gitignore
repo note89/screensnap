@@ -1,0 +1,20 @@
+# Swift build artifacts
+.build/
+build/
+
+# Xcode / derived data
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Packaged artifacts
+*.zip
+*.dmg
+*.pkg
+
+# macOS clutter
+.DS_Store
+**/.DS_Store
+
+# Claude Code project files
+.claude/
