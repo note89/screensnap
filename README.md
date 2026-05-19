@@ -1,15 +1,15 @@
 # Screensnap
 
-A lightweight macOS screen recorder that saves to **GIF** or **MP4**. No Electron, no subscriptions — a native Swift/AppKit app that lives in your menu bar.
+A lightweight macOS screen recorder that saves to **GIF** or **MP4**. No Electron, no subscriptions — a native [Swift](https://www.swift.org)/[AppKit](https://developer.apple.com/documentation/appkit) app that lives in your menu bar.
 
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue)
 ![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange)
 
 ## Features
 
-- **Three capture modes** — drag a region, full display, or pick a window
-- **GIF or MP4** output (H.264 via AVFoundation)
-- **gifski support** — optional high-quality GIF encoding (install via Homebrew)
+- **Three capture modes** — drag a region, full display, or pick a window (via [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit))
+- **GIF or MP4** output (H.264 via [AVFoundation](https://developer.apple.com/documentation/avfoundation))
+- **gifski support** — optional high-quality GIF encoding via [gifski](https://github.com/imageoptim/gifski)
 - **Countdown overlay** — configurable start delay with a visible countdown and Cancel support
 - **Copy to clipboard** — paste directly into Slack, Discord, iMessage, or any browser
 - **Menu bar item** — start/stop/cancel from the menu bar; pulsing red dot while recording
@@ -76,7 +76,7 @@ The release binary is stripped and optimised. The `.app` lands at `build/GifReco
 
 ## gifski (optional, better GIF quality)
 
-[gifski](https://gif.ski) produces significantly smaller and higher-quality GIFs than the built-in ImageIO encoder. Install it with Homebrew:
+[gifski](https://gif.ski) ([GitHub](https://github.com/imageoptim/gifski)) produces significantly smaller and higher-quality GIFs than the built-in ImageIO encoder. Install it with Homebrew:
 
 ```bash
 brew install gifski
