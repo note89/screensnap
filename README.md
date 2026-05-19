@@ -25,7 +25,7 @@ A lightweight macOS screen recorder that saves to **GIF** or **MP4**. No Electro
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/screensnap.git
+git clone https://github.com/note89/screensnap.git
 cd screensnap
 
 # One-time: create a self-signed cert so Screen Recording permission
