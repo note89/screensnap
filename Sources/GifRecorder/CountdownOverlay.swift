@@ -10,6 +10,7 @@ enum CountdownOverlay {
 
         return await withCheckedContinuation { continuation in
             var resolved = false
+            @MainActor
             func finish(_ cancelled: Bool) {
                 guard !resolved else { return }
                 resolved = true

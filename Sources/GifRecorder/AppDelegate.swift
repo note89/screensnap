@@ -73,7 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
             Task.detached(priority: .userInitiated) {
                 guard let data = try? Data(contentsOf: url) else { return }
                 await MainActor.run {
-                    pb.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
+                    _ = pb.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
                 }
             }
         }
@@ -311,7 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
 
     @MainActor
     private func writeGifDataToClipboard(_ data: Data) {
-        NSPasteboard.general.setData(data, forType: NSPasteboard.PasteboardType(UTType.gif.identifier))
+        _ = NSPasteboard.general.setData(data, forType: NSPasteboard.PasteboardType(UTType.gif.identifier))
     }
 
     private func presentError(_ error: Error) {

@@ -10,10 +10,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "GifRecorder",
-            path: "Sources/GifRecorder",
-            resources: [
-                .process("Resources")
-            ]
+            path: "Sources/GifRecorder"
         )
     ]
 )

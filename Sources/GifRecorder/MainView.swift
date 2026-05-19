@@ -266,7 +266,7 @@ final class MainView: NSView {
         Task.detached(priority: .userInitiated) {
             guard let data = try? Data(contentsOf: url) else { return }
             await MainActor.run {
-                pb.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
+                _ = pb.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
             }
         }
     }

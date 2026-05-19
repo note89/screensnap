@@ -31,9 +31,9 @@ if [[ "$ROOT/Scripts/make-icon.swift" -nt "$ROOT/Resources/AppIcon.icns" ]]; the
 fi
 cp "$ROOT/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
-# Copy any SwiftPM resource bundle next to the executable so Bundle.main works.
-if [[ -d "$BIN_DIR/GifRecorder_GifRecorder.bundle" ]]; then
-    cp -R "$BIN_DIR/GifRecorder_GifRecorder.bundle" "$APP_DIR/Contents/Resources/"
+if [[ -f "$ROOT/Resources/gifski" ]]; then
+    cp "$ROOT/Resources/gifski" "$APP_DIR/Contents/Resources/gifski"
+    chmod +x "$APP_DIR/Contents/Resources/gifski"
 fi
 
 # Try the named cert first if it's trusted; otherwise fall back to ad-hoc.
