@@ -8,8 +8,7 @@ final class MainView: NSView {
     private let formatPicker = NSPopUpButton()
     private let modePicker = NSPopUpButton()
     private let permissionStatus = NSTextField(labelWithString: "")
-    private let openSettingsButton = NSButton(title: "Open System Settings", target: nil, action: nil)
-    private let requestPermissionButton = NSButton(title: "Request permission", target: nil, action: nil)
+    private let requestPermissionButton = NSButton(title: "Grant Screen Recording Access", target: nil, action: nil)
     private var permissionTimer: Timer?
     private let framerateField = NSTextField()
     private let downsampleField = NSTextField()
@@ -103,13 +102,10 @@ final class MainView: NSView {
 
         // Permission row at the very top so it's the first thing the user sees.
         permissionStatus.font = .systemFont(ofSize: 12)
-        openSettingsButton.bezelStyle = .rounded
-        openSettingsButton.target = self
-        openSettingsButton.action = #selector(openSettingsTapped)
         requestPermissionButton.bezelStyle = .rounded
         requestPermissionButton.target = self
         requestPermissionButton.action = #selector(requestPermissionTapped)
-        let permissionRow = NSStackView(views: [permissionStatus, openSettingsButton, requestPermissionButton])
+        let permissionRow = NSStackView(views: [permissionStatus, requestPermissionButton])
         permissionRow.orientation = .horizontal
         permissionRow.spacing = 8
 
@@ -287,10 +283,6 @@ final class MainView: NSView {
         onStart()
     }
 
-    @objc private func openSettingsTapped() {
-        Permissions.openScreenRecordingSettings()
-    }
-
     @objc private func requestPermissionTapped() {
         // First call shows the system prompt; later calls are no-ops if the
         // user already chose. We open System Settings as a follow-up so the
@@ -306,7 +298,6 @@ final class MainView: NSView {
             : "Screen Recording: ❌ not granted"
         permissionStatus.textColor = ok ? .systemGreen : .systemRed
         // Hide the action buttons once we're good — keeps the launcher tidy.
-        openSettingsButton.isHidden = ok
         requestPermissionButton.isHidden = ok
         if ok {
             permissionTimer?.invalidate()
