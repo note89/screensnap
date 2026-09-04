@@ -7,13 +7,13 @@ A lightweight macOS screen recorder that saves to **GIF** or **MP4**. No Electro
 
 ## Features
 
-- **Three capture modes** — drag a region, full display, or pick a window (via [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit))
+- **Three capture modes** — full display (the default), drag a region, or pick a window (via [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit))
 - **GIF or MP4** output (H.264 via [AVFoundation](https://developer.apple.com/documentation/avfoundation))
 - **gifski support** — optional high-quality GIF encoding via [gifski](https://github.com/imageoptim/gifski)
-- **Countdown overlay** — configurable start delay with a visible countdown and Cancel support
-- **Copy to clipboard** — paste directly into Slack, Discord, iMessage, or any browser
+- **3-second countdown** — on by default, on the display being recorded; cancel with the button, Escape, or `⌘⇧.`
+- **Copy to clipboard** — the file reference for Finder, Mail and chat apps, plus the raw bytes for anything that pastes media inline
 - **Menu bar item** — start/stop/cancel from the menu bar; pulsing red dot while recording
-- **Global hotkey** — `⌘⇧.` stops the current recording from anywhere
+- **Global hotkey** — `⌘⇧.` cancels the countdown, or stops the current recording, from anywhere
 - No microphone, no network, no telemetry
 
 ## Requirements
@@ -90,17 +90,21 @@ You can also drop a `gifski` binary directly into `Resources/` to bundle it insi
 
 | Setting | Default | Notes |
 |---|---|---|
-| Capture mode | Region | Region / Full screen / Window |
-| Output format | GIF | GIF or MP4 |
+| Capture mode | Full screen | Full screen / Region / Window |
+| Output format | GIF | GIF or MP4 (no audio track) |
 | Framerate | 15 fps | 1–60 fps |
-| Downsample | 1× | 1–4× (reduces pixel dimensions) |
-| Start delay | 0 s | Shows a countdown overlay; Escape cancels |
+| Downsample | 1× | 1–4×; divides the recorded pixel dimensions. Worth raising for full-screen Retina GIFs |
+| Countdown | 3 s | Overlay on the recorded display; cancel with the button, Escape, or `⌘⇧.`. Set to 0 to skip |
 | Capture cursor | On | |
 | Use gifski | Off | Requires gifski on PATH or in Resources/ |
-| gifski quality | 80 | 20–100 |
-| Copy to clipboard | On | Writes file URL + raw GIF/MP4 bytes |
+| gifski quality | 80 | 20–100. No UI yet — set `recording.gifskiQuality` in UserDefaults |
+| Copy to clipboard | On | Writes `public.file-url` + the legacy filenames flavor, plus raw bytes for files under 64 MB |
 | Reveal in Finder | Off | |
-| Show notification | On | Brief toast after save |
+| Show notification | On | Brief toast after save. No UI yet — set `interface.showNotification` |
+
+Files are written to `~/Documents/gif-recordings/` with an ISO-style timestamped name;
+a `-2`, `-3` suffix is added if a name is already taken. The folder and the name
+format have no UI yet either (`persist.saveFolder`, `interface.filenameFormat`).
 
 ## Project layout
 
@@ -111,6 +115,7 @@ Sources/GifRecorder/
   Encoders.swift          GIF (ImageIO + gifski) and MP4 encoders
   RegionSelector.swift    Drag-to-select overlay (NSPanel, all displays)
   ControlBar.swift        Floating HUD shown while recording
+  Clipboard.swift         Pasteboard publishing for finished recordings
   CountdownOverlay.swift  Pre-recording countdown panel
   StatusItem.swift        Menu bar item and menu
   MainView.swift          Settings / launcher window

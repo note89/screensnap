@@ -8,14 +8,14 @@ enum Toast {
     private static var current: NSWindowController?
     private static var dismissTask: Task<Void, Never>?
 
-    static func show(_ headline: String, filename: String? = nil, duration: TimeInterval = 2.2) {
+    static func show(_ headline: String, detail: String? = nil, duration: TimeInterval = 2.2) {
         // Cancel any previous toast so a rapid sequence of recordings doesn't
         // stack windows on top of each other.
         dismissTask?.cancel()
         current?.window?.orderOut(nil)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: filename == nil ? 44 : 60),
+            contentRect: NSRect(x: 0, y: 0, width: 280, height: detail == nil ? 44 : 60),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -45,8 +45,8 @@ enum Toast {
         stack.spacing = 2
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(title)
-        if let filename = filename {
-            let sub = NSTextField(labelWithString: filename)
+        if let detail = detail {
+            let sub = NSTextField(labelWithString: detail)
             sub.font = .systemFont(ofSize: 11)
             sub.textColor = .secondaryLabelColor
             sub.lineBreakMode = .byTruncatingMiddle

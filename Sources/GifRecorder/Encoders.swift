@@ -4,6 +4,21 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
+/// Shared error for "the recording ended before any frame was captured". Easy to
+/// hit now that a countdown precedes every recording, and each encoder fails in its
+/// own unhelpful way otherwise — the MP4 writer worst of all, since finishing a
+/// writer that was never started raises an Obj-C exception and kills the process.
+enum EncoderError: LocalizedError {
+    case noFrames
+
+    var errorDescription: String? {
+        switch self {
+        case .noFrames:
+            return "Nothing was captured — the recording stopped before the first frame arrived."
+        }
+    }
+}
+
 /// A streaming frame encoder. Frames arrive one at a time and the encoder
 /// is finalized at the end. Encoders own their own scratch state.
 @MainActor
@@ -75,6 +90,11 @@ final class ImageIOGifEncoder: FrameEncoder {
     func finish() async throws -> URL {
         guard case .active(let destination) = state else {
             throw NSError(domain: "GifRecorder", code: 2, userInfo: [NSLocalizedDescriptionKey: "GIF destination already finalized"])
+        }
+        guard frameCount > 0 else {
+            state = .cancelled
+            try? FileManager.default.removeItem(at: outputURL)
+            throw EncoderError.noFrames
         }
         state = .finished
         if !CGImageDestinationFinalize(destination) {
@@ -164,6 +184,8 @@ final class GifskiEncoder: FrameEncoder {
         } catch {
             throw error
         }
+
+        guard !frameFiles.isEmpty else { throw EncoderError.noFrames }
 
         var arguments = [
             "--fps", String(framerate),
@@ -280,6 +302,13 @@ final class MP4Encoder: FrameEncoder {
     }
 
     func finish() async throws -> URL {
+        // `startWriting` only runs on the first appended frame. Finishing a writer
+        // still in `.unknown` raises `NSInternalInconsistencyException`, which is an
+        // Obj-C exception rather than a Swift error — it takes the process down.
+        guard startTime != nil else {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw EncoderError.noFrames
+        }
         input.markAsFinished()
         let writer = self.writer
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in

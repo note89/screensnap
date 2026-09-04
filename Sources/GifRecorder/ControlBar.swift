@@ -11,7 +11,9 @@ final class ControlBarController: NSWindowController {
     var onStop: (() -> Void)?
     var onCancel: (() -> Void)?
 
-    convenience init() {
+    /// `screen` is the display being recorded, so the HUD lands where the user is
+    /// looking instead of always on the main display.
+    convenience init(screen: NSScreen? = nil) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 220, height: 44),
             styleMask: [.titled, .fullSizeContentView],
@@ -34,7 +36,7 @@ final class ControlBarController: NSWindowController {
 
         self.init(window: window)
         configureLayout()
-        positionInTopRight()
+        positionInTopRight(on: screen ?? NSScreen.main)
     }
 
     private func configureLayout() {
@@ -56,6 +58,8 @@ final class ControlBarController: NSWindowController {
         cancelButton.bezelStyle = .roundRect
         cancelButton.target = self
         cancelButton.action = #selector(cancelClicked)
+        cancelButton.toolTip = "Discard this recording"
+        stopButton.toolTip = "Finish and save (⌘⇧.)"
 
         for v in [dot, timerLabel, stopButton, cancelButton] {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -80,8 +84,8 @@ final class ControlBarController: NSWindowController {
         ])
     }
 
-    private func positionInTopRight() {
-        guard let window = window, let screen = NSScreen.main else { return }
+    private func positionInTopRight(on screen: NSScreen?) {
+        guard let window = window, let screen = screen else { return }
         let margin: CGFloat = 24
         let frame = NSRect(
             x: screen.visibleFrame.maxX - window.frame.width - margin,
@@ -92,13 +96,26 @@ final class ControlBarController: NSWindowController {
         window.setFrame(frame, display: false)
     }
 
+    /// Put the HUD on screen without taking focus. `showWindow` makes the window
+    /// key, which deactivates the app the user is about to record — visible in the
+    /// first frames as a dimmed title bar and a stopped text caret.
     func show() {
         startedAt = Date()
-        showWindow(nil)
+        window?.orderFrontRegardless()
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        tick()
+    }
+
+    /// Reset the clock to the moment capture actually began. The HUD has to go up
+    /// first so its window ID can be excluded from the stream, and starting the
+    /// stream then awaits a shareable-content fetch — without this the elapsed time
+    /// runs permanently ahead of the recording.
+    func markCaptureStarted() {
+        startedAt = Date()
+        tick()
     }
 
     func hide() {

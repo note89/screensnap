@@ -2,9 +2,22 @@ import AppKit
 
 @MainActor
 enum CountdownOverlay {
-    /// Displays a floating countdown panel. Returns true if the user cancelled, false if it ran to completion.
-    static func run(seconds: Int) async -> Bool {
+    /// Set while a countdown is on screen, so the global stop hotkey can cancel it.
+    private static var cancelActive: (@MainActor () -> Void)?
+
+    /// Cancel a countdown that is currently on screen. Returns whether there was one.
+    @discardableResult
+    static func cancelIfRunning() -> Bool {
+        guard let cancel = cancelActive else { return false }
+        cancel()
+        return true
+    }
+
+    /// Displays a floating countdown panel on `screen`, or the main screen when nil.
+    /// Returns true if the user cancelled, false if it ran to completion.
+    static func run(seconds: Int, on screen: NSScreen? = nil) async -> Bool {
         let panel = CountdownPanel()
+        panel.center(on: screen ?? NSScreen.main)
         panel.orderFrontRegardless()
         panel.makeKey()
 
@@ -14,11 +27,16 @@ enum CountdownOverlay {
             func finish(_ cancelled: Bool) {
                 guard !resolved else { return }
                 resolved = true
+                cancelActive = nil
                 panel.orderOut(nil)
                 continuation.resume(returning: cancelled)
             }
 
             panel.onCancel = { finish(true) }
+            // The panel is non-activating, so it only sees Escape when it happens to
+            // be key. Registering here lets the global ⌘⇧. hotkey — the same one that
+            // finishes a recording — back out of the countdown from any app.
+            cancelActive = { finish(true) }
 
             Task { @MainActor in
                 for remaining in stride(from: seconds, through: 1, by: -1) {
@@ -34,8 +52,9 @@ enum CountdownOverlay {
 
 private final class CountdownPanel: NSPanel {
     private let digitLabel: NSTextField
+    private let hintLabel: NSTextField
     private let cancelButton: NSButton
-    var onCancel: (() -> Void)?
+    var onCancel: (@MainActor () -> Void)?
 
     override var canBecomeKey: Bool { true }
 
@@ -45,14 +64,21 @@ private final class CountdownPanel: NSPanel {
         digitLabel.drawsBackground = false
         digitLabel.isBezeled = false
         digitLabel.textColor = .white
-        digitLabel.font = NSFont.boldSystemFont(ofSize: 110)
+        digitLabel.font = NSFont.boldSystemFont(ofSize: 96)
         digitLabel.alignment = .center
 
         cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
         cancelButton.bezelStyle = .rounded
+        // Escape backs out whenever the panel is key.
+        cancelButton.keyEquivalent = "\u{1b}"
+
+        hintLabel = NSTextField(labelWithString: "esc or ⌘⇧. to cancel")
+        hintLabel.font = .systemFont(ofSize: 10)
+        hintLabel.textColor = NSColor.white.withAlphaComponent(0.65)
+        hintLabel.alignment = .center
 
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 180, height: 180),
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -70,10 +96,10 @@ private final class CountdownPanel: NSPanel {
 
         guard let contentView = contentView else { return }
 
-        let stack = NSStackView(views: [digitLabel, cancelButton])
+        let stack = NSStackView(views: [digitLabel, cancelButton, hintLabel])
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = 8
+        stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(stack)
 
@@ -83,22 +109,16 @@ private final class CountdownPanel: NSPanel {
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.leadingAnchor, constant: 8),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -8),
         ])
-
-        if let screen = NSScreen.main {
-            let origin = NSPoint(
-                x: screen.frame.midX - frame.width / 2,
-                y: screen.frame.midY - frame.height / 2
-            )
-            setFrameOrigin(origin)
-        }
     }
 
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
-            onCancel?()
-        } else {
-            super.keyDown(with: event)
-        }
+    /// Place the panel in the middle of the screen that is about to be recorded,
+    /// rather than always on the main one.
+    func center(on screen: NSScreen?) {
+        guard let screen = screen else { return }
+        setFrameOrigin(NSPoint(
+            x: screen.frame.midX - frame.width / 2,
+            y: screen.frame.midY - frame.height / 2
+        ))
     }
 
     func setDigit(_ n: Int) {

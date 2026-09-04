@@ -55,21 +55,21 @@ final class MainView: NSView {
 
         let gifItem = NSMenuItem(title: "GIF", action: nil, keyEquivalent: "")
         gifItem.representedObject = OutputFormat.gif
-        let mp4Item = NSMenuItem(title: "MP4 (H.264)", action: nil, keyEquivalent: "")
+        let mp4Item = NSMenuItem(title: "MP4 (H.264, no audio)", action: nil, keyEquivalent: "")
         mp4Item.representedObject = OutputFormat.mp4
         formatPicker.menu?.addItem(gifItem)
         formatPicker.menu?.addItem(mp4Item)
         formatPicker.target = self
         formatPicker.action = #selector(saveSettings)
 
-        let regionItem = NSMenuItem(title: "Region (drag to select)", action: nil, keyEquivalent: "")
-        regionItem.representedObject = CaptureMode.region
         let displayItem = NSMenuItem(title: "Full screen", action: nil, keyEquivalent: "")
         displayItem.representedObject = CaptureMode.display
+        let regionItem = NSMenuItem(title: "Region (drag to select)", action: nil, keyEquivalent: "")
+        regionItem.representedObject = CaptureMode.region
         let windowItem = NSMenuItem(title: "Window…", action: nil, keyEquivalent: "")
         windowItem.representedObject = CaptureMode.window
-        modePicker.menu?.addItem(regionItem)
         modePicker.menu?.addItem(displayItem)
+        modePicker.menu?.addItem(regionItem)
         modePicker.menu?.addItem(windowItem)
         modePicker.target = self
         modePicker.action = #selector(saveSettings)
@@ -82,7 +82,7 @@ final class MainView: NSView {
         downsampleField.target = self
         downsampleField.action = #selector(saveSettings)
 
-        delayField.placeholderString = "delay (s)"
+        delayField.placeholderString = "seconds"
         delayField.target = self
         delayField.action = #selector(saveSettings)
 
@@ -113,7 +113,7 @@ final class MainView: NSView {
         let formRow1 = labeledRow("Format", control: formatPicker)
         let formRow2 = labeledRow("Framerate", control: framerateField)
         let formRow3 = labeledRow("Downsample", control: downsampleField)
-        let formRow4 = labeledRow("Start delay", control: delayField)
+        let formRow4 = labeledRow("Countdown", control: delayField)
 
         // "Last recording" section — shown at the bottom so it doesn't compete
         // with the Record button for attention but is easy to find when needed.
@@ -254,32 +254,15 @@ final class MainView: NSView {
     }
 
     @objc private func copyAgainTapped() {
-        guard let url = Settings.shared.lastRecordingURL else { return }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        (url as NSURL).write(to: pb)
-        guard url.pathExtension.lowercased() == "gif" else { return }
-        Task.detached(priority: .userInitiated) {
-            guard let data = try? Data(contentsOf: url) else { return }
-            await MainActor.run {
-                _ = pb.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
-            }
-        }
+        Clipboard.copyWithFeedback(Settings.shared.lastRecordingURL)
+        refreshLastRecording()
     }
 
     @objc private func recordTapped() {
         saveSettings()
-        if !Permissions.hasScreenRecording {
-            let alert = NSAlert()
-            alert.messageText = "Screen Recording permission required"
-            alert.informativeText = "Toggle GifRecorder on in System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch the app."
-            alert.addButton(withTitle: "Open System Settings")
-            alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn {
-                Permissions.openScreenRecordingSettings()
-            }
-            return
-        }
+        // Echo the clamped values back, so a typo that became 1 fps is visible
+        // rather than silently recorded at 1 fps.
+        loadFromSettings()
         onStart()
     }
 
@@ -295,7 +278,7 @@ final class MainView: NSView {
         let ok = Permissions.hasScreenRecording
         permissionStatus.stringValue = ok
             ? "Screen Recording: ✅ granted"
-            : "Screen Recording: ❌ not granted"
+            : "Screen Recording: ❌ not granted — enable \(AppDelegate.displayName)"
         permissionStatus.textColor = ok ? .systemGreen : .systemRed
         // Hide the action buttons once we're good — keeps the launcher tidy.
         requestPermissionButton.isHidden = ok

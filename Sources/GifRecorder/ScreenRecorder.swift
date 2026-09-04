@@ -20,7 +20,7 @@ enum CaptureSource {
     /// A single window — works even when the window is in a different Space.
     case window(SCWindow)
 
-    /// Output dimensions in pixels (accounting for the backing scale on
+    /// Full-resolution dimensions in pixels (accounting for the backing scale on
     /// Retina displays). The region case already carries pixel-space rects;
     /// the others are in points and need to be scaled here.
     var pixelSize: CGSize {
@@ -28,15 +28,47 @@ enum CaptureSource {
         case .region(let r):
             return r.pixelRect.size
         case .display(let d):
-            let scale = NSScreen.screens.first(where: {
-                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == d.displayID
-            })?.backingScaleFactor ?? 2
+            let scale = NSScreen.screens.first(where: { $0.displayID == d.displayID })?.backingScaleFactor ?? 2
             return CGSize(width: CGFloat(d.width) * scale, height: CGFloat(d.height) * scale)
         case .window(let w):
             let midPoint = CGPoint(x: w.frame.midX, y: w.frame.midY)
             let scale = NSScreen.screens.first(where: { $0.frame.contains(midPoint) })?.backingScaleFactor ?? 2
             return CGSize(width: w.frame.width * scale, height: w.frame.height * scale)
         }
+    }
+
+    /// The size we actually encode: `pixelSize` divided by the user's downsample
+    /// factor, with both axes rounded to an even number. H.264 rejects odd
+    /// dimensions, and a region drag produces them routinely.
+    ///
+    /// This matters a lot more now that full screen is the default capture mode —
+    /// a Retina display at 1x is a 5120x2880 GIF.
+    func outputSize(downsample: Int) -> CGSize {
+        let factor = CGFloat(max(1, downsample))
+        let full = pixelSize
+        return CGSize(
+            width: Self.evenPixels(full.width / factor),
+            height: Self.evenPixels(full.height / factor)
+        )
+    }
+
+    /// The screen this capture comes from, so the countdown can appear where the
+    /// user is looking. nil for window capture: `SCWindow.frame` is in top-left CG
+    /// coordinates and matching it against `NSScreen.frame` needs a conversion we
+    /// don't do anywhere else.
+    var screen: NSScreen? {
+        switch self {
+        case .region(let r):
+            return NSScreen.screens.first { $0.displayID == r.displayID }
+        case .display(let d):
+            return NSScreen.screens.first { $0.displayID == d.displayID }
+        case .window:
+            return nil
+        }
+    }
+
+    private static func evenPixels(_ value: CGFloat) -> CGFloat {
+        max(2, (value / 2).rounded(.down) * 2)
     }
 }
 
@@ -62,6 +94,7 @@ enum StopReason {
 final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let source: CaptureSource
     private let framerate: Int
+    private let downsample: Int
     private let captureCursor: Bool
     private let excludeWindowIDs: [CGWindowID]
     private weak var sink: FrameSink?
@@ -83,18 +116,17 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         initialState: FrameThrottle(startHostTime: 0, lastEmittedTime: -.infinity))
     private let isCapturingFlag = OSAllocatedUnfairLock(initialState: false)
 
-    /// The pixel size of the output, available after `start()` succeeds.
-    private(set) var pixelSize: CGSize = .zero
-
     init(
         source: CaptureSource,
         framerate: Int,
+        downsample: Int,
         captureCursor: Bool,
         excludeWindowIDs: [CGWindowID] = [],
         sink: FrameSink
     ) {
         self.source = source
         self.framerate = max(1, framerate)
+        self.downsample = max(1, downsample)
         self.captureCursor = captureCursor
         self.excludeWindowIDs = excludeWindowIDs
         self.sink = sink
@@ -102,6 +134,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() async throws {
         guard case .idle = captureState else { throw ScreenRecorderError.alreadyRunning }
+
+        // Encode at the downsampled size; SCStream scales the captured content to
+        // `config.width`/`height` for us, so no resampling pass of our own.
+        let output = source.outputSize(downsample: downsample)
 
         let config = SCStreamConfiguration()
         config.pixelFormat = kCVPixelFormatType_32BGRA
@@ -111,6 +147,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         // to keep encoder timestamps regular.
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(framerate))
         config.colorSpaceName = CGColorSpace.sRGB
+        config.width = Int(output.width)
+        config.height = Int(output.height)
 
         let filter: SCContentFilter
         switch source {
@@ -121,33 +159,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             let excluded = content.windows.filter { excludeWindowIDs.contains($0.windowID) }
             config.sourceRect = region.pixelRect
-            config.width = Int(region.pixelRect.width)
-            config.height = Int(region.pixelRect.height)
-            pixelSize = region.pixelRect.size
             filter = SCContentFilter(display: display, excludingWindows: excluded)
 
         case .display(let display):
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             let excluded = content.windows.filter { excludeWindowIDs.contains($0.windowID) }
-            // Find the NSScreen matching this display for correct Retina scale
-            let scale = NSScreen.screens.first(where: {
-                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID
-            }).map { $0.backingScaleFactor } ?? 2
-            let w = Int(Double(display.width) * scale)
-            let h = Int(Double(display.height) * scale)
-            config.width = w
-            config.height = h
-            pixelSize = CGSize(width: w, height: h)
             filter = SCContentFilter(display: display, excludingWindows: excluded)
 
         case .window(let window):
             // `desktopIndependentWindow` captures the window across Space changes
             // and remains valid even when the window is minimized or on another Space.
-            let midPoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
-            let scale = NSScreen.screens.first(where: { $0.frame.contains(midPoint) })?.backingScaleFactor ?? 2
-            config.width = Int(window.frame.size.width * scale)
-            config.height = Int(window.frame.size.height * scale)
-            pixelSize = CGSize(width: config.width, height: config.height)
             filter = SCContentFilter(desktopIndependentWindow: window)
         }
 

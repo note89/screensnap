@@ -110,7 +110,8 @@ private final class OverlayWindow: NSPanel {
     }
 }
 
-private extension NSScreen {
+extension NSScreen {
+    /// The `CGDirectDisplayID` behind this screen, falling back to the main display.
     var displayID: CGDirectDisplayID {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
             ?? CGMainDisplayID()

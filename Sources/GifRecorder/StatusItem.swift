@@ -46,13 +46,13 @@ final class StatusItemController: NSObject {
     private func configure() {
         // Direct-record items — skip the launcher window entirely. These are
         // shown when idle and hidden when a recording is in progress.
-        recordRegionItem.title = "Record area"
-        recordRegionItem.action = #selector(recordRegion)
-        recordRegionItem.target = self
-
         recordDisplayItem.title = "Record full screen"
         recordDisplayItem.action = #selector(recordDisplay)
         recordDisplayItem.target = self
+
+        recordRegionItem.title = "Record area"
+        recordRegionItem.action = #selector(recordRegion)
+        recordRegionItem.target = self
 
         recordWindowItem.title = "Record window…"
         recordWindowItem.action = #selector(recordWindow)
@@ -89,8 +89,9 @@ final class StatusItemController: NSObject {
         openItem.target = self
         let quitItem = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
-        menu.addItem(recordRegionItem)
+        // Full screen leads: it is the default capture mode.
         menu.addItem(recordDisplayItem)
+        menu.addItem(recordRegionItem)
         menu.addItem(recordWindowItem)
         menu.addItem(.separator())
         menu.addItem(stopItem)
@@ -102,6 +103,10 @@ final class StatusItemController: NSObject {
         menu.addItem(.separator())
         menu.addItem(openItem)
         menu.addItem(quitItem)
+        // AppKit re-derives item enablement from target+action by default, which
+        // silently undid the `isEnabled` we set in `updateLastRecordingRow` — the
+        // "Copy last recording" row looked live with nothing to copy.
+        menu.autoenablesItems = false
         item.menu = menu
 
         // Refresh the "last recording" filename each time the menu opens,

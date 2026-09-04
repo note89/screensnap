@@ -32,16 +32,17 @@ final class Settings {
         static let saveFolder = "persist.saveFolder"
         static let filenameFormat = "interface.filenameFormat"
         static let lastRecordingPath = "persist.lastRecordingPath"
+        static let defaultsVersion = "persist.defaultsVersion"
     }
 
     private init() {
         defaults.register(defaults: [
             Key.framerate: 15,
             Key.downsample: 1,
-            Key.startDelay: 0,
+            Key.startDelay: 3,
             Key.captureCursor: true,
             Key.outputFormat: OutputFormat.gif.rawValue,
-            Key.captureMode: CaptureMode.region.rawValue,
+            Key.captureMode: CaptureMode.display.rawValue,
             Key.gifskiEnabled: false,
             Key.gifskiQuality: 80,
             Key.showNotification: true,
@@ -49,6 +50,23 @@ final class Settings {
             Key.copyToClipboard: true,
             Key.filenameFormat: "%Y-%m-%dT%H-%M-%S",
         ])
+        migrateDefaults()
+    }
+
+    /// Registered defaults only reach installs that have never written the key,
+    /// and the launcher writes every key the first time any control is touched.
+    /// So existing installs would keep no countdown and region capture forever.
+    /// This nudges those two keys once, and only where they still hold the value
+    /// we used to ship, so a deliberate choice survives.
+    private func migrateDefaults() {
+        guard defaults.integer(forKey: Key.defaultsVersion) < 1 else { return }
+        if defaults.integer(forKey: Key.startDelay) == 0 {
+            defaults.set(3, forKey: Key.startDelay)
+        }
+        if defaults.string(forKey: Key.captureMode) == CaptureMode.region.rawValue {
+            defaults.set(CaptureMode.display.rawValue, forKey: Key.captureMode)
+        }
+        defaults.set(1, forKey: Key.defaultsVersion)
     }
 
     var framerate: Int {
@@ -77,7 +95,7 @@ final class Settings {
     }
 
     var captureMode: CaptureMode {
-        get { CaptureMode(rawValue: defaults.string(forKey: Key.captureMode) ?? "") ?? .region }
+        get { CaptureMode(rawValue: defaults.string(forKey: Key.captureMode) ?? "") ?? .display }
         set { defaults.set(newValue.rawValue, forKey: Key.captureMode) }
     }
 
@@ -107,7 +125,7 @@ final class Settings {
     }
 
     var filenameFormat: String {
-        get { defaults.string(forKey: Key.filenameFormat) ?? "Recording %Y-%m-%d %H-%M-%S" }
+        get { defaults.string(forKey: Key.filenameFormat) ?? "%Y-%m-%dT%H-%M-%S" }
         set { defaults.set(newValue, forKey: Key.filenameFormat) }
     }
 
@@ -137,20 +155,82 @@ final class Settings {
         set { defaults.set(newValue.path, forKey: Key.saveFolder) }
     }
 
-    /// Short, sortable filename derived from `filenameFormat`.
-    /// The default format produces ISO-style names like `2026-05-17T14-30-00.gif`.
-    func defaultFilename(extension ext: String) -> String {
+    /// Short, sortable filename stem derived from `filenameFormat`.
+    /// The default format produces ISO-style names like `2026-05-17T14-30-00`.
+    func defaultStem() -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        let fmt = filenameFormat
-            .replacingOccurrences(of: "%Y", with: "yyyy")
-            .replacingOccurrences(of: "%m", with: "MM")
-            .replacingOccurrences(of: "%d", with: "dd")
-            .replacingOccurrences(of: "%H", with: "HH")
-            .replacingOccurrences(of: "%M", with: "mm")
-            .replacingOccurrences(of: "%S", with: "ss")
-        formatter.dateFormat = fmt
-        return "\(formatter.string(from: Date())).\(ext)"
+        formatter.dateFormat = Self.dateFormat(from: filenameFormat)
+        let stem = formatter.string(from: Date())
+        // An unusable pattern produces an empty string, which would name every
+        // recording ".gif" — a hidden file the next recording then overwrites.
+        return stem.isEmpty ? Self.fallbackStem() : stem
+    }
+
+    /// A URL in `folder` that nothing occupies yet.
+    ///
+    /// Two recordings finishing in the same second produced the same timestamped
+    /// name, and both encoders overwrite without asking (`AVAssetWriter` even
+    /// deletes the existing file first), so the earlier recording simply vanished.
+    func availableURL(in folder: URL, extension ext: String) throws -> URL {
+        let stem = defaultStem()
+        for attempt in 0..<100 {
+            let name = attempt == 0 ? "\(stem).\(ext)" : "\(stem)-\(attempt + 1).\(ext)"
+            let candidate = folder.appendingPathComponent(name)
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+        throw NSError(domain: "GifRecorder", code: 9, userInfo: [
+            NSLocalizedDescriptionKey: "Could not find an unused filename in \(folder.path).",
+        ])
+    }
+
+    /// Translate the `%`-token format into a `DateFormatter` pattern.
+    ///
+    /// Everything that is not a token gets quoted. Unicode TR35 reserves every
+    /// ASCII letter as a pattern character, so the bare `T` in the default
+    /// `%Y-%m-%dT%H-%M-%S` has to be escaped — an unescaped one risks an invalid
+    /// pattern, and an invalid pattern formats to nothing at all.
+    private static func dateFormat(from format: String) -> String {
+        let tokens: [Character: String] = [
+            "Y": "yyyy", "m": "MM", "d": "dd", "H": "HH", "M": "mm", "S": "ss",
+        ]
+        var pattern = ""
+        var literal = ""
+
+        func flushLiteral() {
+            guard !literal.isEmpty else { return }
+            // A single quote is the escape character, so a literal one doubles up.
+            pattern += "'" + literal.replacingOccurrences(of: "'", with: "''") + "'"
+            literal = ""
+        }
+
+        var index = format.startIndex
+        while index < format.endIndex {
+            let character = format[index]
+            let next = format.index(after: index)
+            guard character == "%", next < format.endIndex else {
+                literal.append(character)
+                index = next
+                continue
+            }
+            if let token = tokens[format[next]] {
+                flushLiteral()
+                pattern += token
+            } else {
+                // Unknown token, including `%%`, passes through as a literal.
+                literal.append(format[next])
+            }
+            index = format.index(after: next)
+        }
+        flushLiteral()
+        return pattern
+    }
+
+    private static func fallbackStem() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH-mm-ss"
+        return formatter.string(from: Date())
     }
 }
 

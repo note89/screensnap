@@ -1,7 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
 import ScreenCaptureKit
-import UniformTypeIdentifiers
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
@@ -11,13 +10,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         let recorder: ScreenRecorder
         let encoder: FrameEncoder
         let controlBar: ControlBarController
-        let outputURL: URL
     }
 
     private var activeSession: RecordingSession?
     private var statusItem: StatusItemController?
     private var stopHotkey: GlobalHotkey?
     private var isRecording: Bool { activeSession != nil }
+
+    /// True from the moment a capture flow begins until it either starts recording
+    /// or backs out. Region selection, the source picker and the countdown all run
+    /// before `activeSession` exists, so without this a second Record click —
+    /// easy to land during a three second countdown — starts a parallel flow that
+    /// fights the first one over the HUD and the output file.
+    private var isStartingCapture = false
+    private var isBusy: Bool { isRecording || isStartingCapture }
 
     // MARK: - App lifecycle
 
@@ -29,13 +35,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
     }
 
     private func installGlobalHotkey() {
-        // Cmd+Shift+. — only meaningful while a recording is in progress.
+        // Cmd+Shift+. — backs out of the countdown before a recording has started,
+        // and finishes the recording once it has. The countdown panel is
+        // non-activating and rarely holds the keyboard, so this is the only way to
+        // abort it without reaching for the mouse.
         stopHotkey = GlobalHotkey(
             keyCode: kVK_ANSI_Period,
             modifiers: cmdKey | shiftKey
         ) { [weak self] in
-            guard let self = self, self.isRecording else { return }
-            Task { await self.stopRecording(reason: .finish) }
+            Task { @MainActor in
+                if CountdownOverlay.cancelIfRunning() { return }
+                guard let self = self, self.isRecording else { return }
+                await self.stopRecording(reason: .finish)
+            }
         }
     }
 
@@ -54,28 +66,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
             Task { await self.stopRecording(reason: .discard) }
         }
         item.onStartRecording = { [weak self] mode in
-            guard let self = self, !self.isRecording else { return }
-            // Use the chosen mode for this recording without changing the
-            // user's saved default. Lets people set Region as their default
-            // and still occasionally fire a Full-screen recording from the menu.
-            self.beginCaptureFlow(sessionMode: mode)
+            // Use the chosen mode for this recording without changing the user's
+            // saved default. Lets people set Region as their default and still
+            // occasionally fire a Full-screen recording from the menu.
+            // `beginCaptureFlow` does the busy check.
+            self?.beginCaptureFlow(sessionMode: mode)
         }
         item.onRevealLast = {
             guard let url = Settings.shared.lastRecordingURL else { return }
             NSWorkspace.shared.activateFileViewerSelecting([url])
         }
         item.onCopyLast = {
-            guard let url = Settings.shared.lastRecordingURL else { return }
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            (url as NSURL).write(to: pb)
-            guard url.pathExtension.lowercased() == "gif" else { return }
-            Task.detached(priority: .userInitiated) {
-                guard let data = try? Data(contentsOf: url) else { return }
-                await MainActor.run {
-                    _ = pb.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
-                }
-            }
+            Clipboard.copyWithFeedback(Settings.shared.lastRecordingURL)
         }
         self.statusItem = item
     }
@@ -112,7 +114,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         let appMenuItem = NSMenuItem()
         main.addItem(appMenuItem)
         let appMenu = NSMenu()
-        appMenu.addItem(NSMenuItem(title: "About GIF Recorder", action: nil, keyEquivalent: ""))
+        appMenu.addItem(NSMenuItem(
+            title: "About GIF Recorder",
+            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+            keyEquivalent: ""
+        ))
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "Hide", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
         appMenu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -133,6 +139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
     // MARK: - Capture flow
 
     private func beginCaptureFlow(sessionMode: CaptureMode? = nil) {
+        guard !isBusy else { return }
+        // Gate permission here rather than in the launcher: the menu bar's
+        // "Record …" items come straight through this function, and without a check
+        // they failed invisibly — SourcePicker swallows the TCC error and returns
+        // nil, so the user saw the launcher blink and nothing else.
+        guard ensureScreenRecordingPermission() else { return }
+        isStartingCapture = true
         mainWindow?.orderOut(nil)
         let mode = sessionMode ?? Settings.shared.captureMode
         switch mode {
@@ -140,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
             regionSelector.begin { [weak self] region in
                 guard let self = self else { return }
                 guard let region = region else {
-                    self.mainWindow?.makeKeyAndOrderFront(nil)
+                    self.abandonCaptureFlow()
                     return
                 }
                 Task { await self.startRecording(source: .region(region)) }
@@ -149,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         case .display:
             Task { @MainActor in
                 guard let display = await SourcePicker.pickDisplay() else {
-                    self.mainWindow?.makeKeyAndOrderFront(nil)
+                    self.abandonCaptureFlow()
                     return
                 }
                 await self.startRecording(source: .display(display))
@@ -158,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         case .window:
             Task { @MainActor in
                 guard let window = await SourcePicker.pickWindow() else {
-                    self.mainWindow?.makeKeyAndOrderFront(nil)
+                    self.abandonCaptureFlow()
                     return
                 }
                 await self.startRecording(source: .window(window))
@@ -166,39 +179,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         }
     }
 
+    /// Back out of a capture flow that never reached `startRecording`.
+    private func abandonCaptureFlow() {
+        isStartingCapture = false
+        mainWindow?.makeKeyAndOrderFront(nil)
+    }
+
     private func startRecording(source: CaptureSource) async {
+        // However this returns, the flow is no longer "starting": it either becomes
+        // the active session or backs out.
+        defer { isStartingCapture = false }
+
         let settings = Settings.shared
+        let outputSize = source.outputSize(downsample: settings.downsample)
 
-        if settings.startDelay > 0 {
-            let cancelled = await CountdownOverlay.run(seconds: settings.startDelay)
-            if cancelled {
-                mainWindow?.makeKeyAndOrderFront(nil)
-                return
-            }
-        }
-
-        // Prepare encoder.
-        let outputURL: URL
+        // Build the encoder *before* the countdown. A bad save folder or a missing
+        // gifski then surfaces straight away instead of after the user has watched
+        // 3-2-1, and the digits sit as close to the real start of capture as we can
+        // get them.
         let encoder: FrameEncoder
         do {
+            let folder = settings.saveFolder
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             switch settings.outputFormat {
             case .gif:
-                let folder = settings.saveFolder
-                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                outputURL = folder.appendingPathComponent(settings.defaultFilename(extension: "gif"))
+                let url = try settings.availableURL(in: folder, extension: "gif")
                 if settings.gifskiEnabled {
-                    encoder = try GifskiEncoder(outputURL: outputURL, framerate: settings.framerate, quality: settings.gifskiQuality)
+                    encoder = try GifskiEncoder(outputURL: url, framerate: settings.framerate, quality: settings.gifskiQuality)
                 } else {
-                    encoder = try ImageIOGifEncoder(outputURL: outputURL, framerate: settings.framerate)
+                    encoder = try ImageIOGifEncoder(outputURL: url, framerate: settings.framerate)
                 }
             case .mp4:
-                let folder = settings.saveFolder
-                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                outputURL = folder.appendingPathComponent(settings.defaultFilename(extension: "mp4"))
+                let url = try settings.availableURL(in: folder, extension: "mp4")
                 encoder = try MP4Encoder(
-                    outputURL: outputURL,
+                    outputURL: url,
                     framerate: settings.framerate,
-                    pixelSize: source.pixelSize
+                    pixelSize: outputSize
                 )
             }
         } catch {
@@ -206,8 +222,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
             mainWindow?.makeKeyAndOrderFront(nil)
             return
         }
-        // Show floating HUD.
-        let bar = ControlBarController()
+
+        if settings.startDelay > 0 {
+            let cancelled = await CountdownOverlay.run(seconds: settings.startDelay, on: source.screen)
+            if cancelled {
+                // The encoder has already opened its output file; don't leave it behind.
+                encoder.cancel()
+                mainWindow?.makeKeyAndOrderFront(nil)
+                return
+            }
+        }
+
+        // Show the floating HUD on the display being recorded.
+        let bar = ControlBarController(screen: source.screen)
         bar.onStop = { [weak self] in Task { await self?.stopRecording(reason: .finish) } }
         bar.onCancel = { [weak self] in Task { await self?.stopRecording(reason: .discard) } }
         bar.show()
@@ -218,22 +245,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         let recorder = ScreenRecorder(
             source: source,
             framerate: settings.framerate,
+            downsample: settings.downsample,
             captureCursor: settings.captureCursor,
             excludeWindowIDs: excluded,
             sink: self
         )
         do {
             try await recorder.start()
+            // `start()` awaits a shareable-content fetch and `startCapture`, so only
+            // now is the elapsed clock honest.
+            bar.markCaptureStarted()
             self.activeSession = RecordingSession(
                 recorder: recorder,
                 encoder: encoder,
-                controlBar: bar,
-                outputURL: outputURL
+                controlBar: bar
             )
             statusItem?.setState(.recording)
         } catch {
-            presentError(error)
+            encoder.cancel()
             bar.hide()
+            presentError(error)
             mainWindow?.makeKeyAndOrderFront(nil)
         }
     }
@@ -255,17 +286,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
                 // No save dialog — the file is already on disk in the save folder
                 // with a unique timestamped name. Copy to clipboard, remember it
                 // as the "last recording" so the user can rename later if they want.
-                if Settings.shared.copyToClipboard {
-                    copyToClipboard(url)
-                }
                 Settings.shared.lastRecordingURL = url
                 NotificationCenter.default.post(name: .lastRecordingChanged, object: nil)
                 if Settings.shared.revealInFinder {
                     NSWorkspace.shared.activateFileViewerSelecting([url])
                 }
-                // Optional toast so the user knows it landed somewhere.
+                var copied = false
+                if Settings.shared.copyToClipboard {
+                    copied = (try? await Clipboard.copy(url)) != nil
+                }
+                // Optional toast so the user knows it landed somewhere. Only promise
+                // a paste when we actually put something on the pasteboard.
                 if Settings.shared.showNotification {
-                    Toast.show("Saved — paste with ⌘V", filename: url.lastPathComponent)
+                    Toast.show(copied ? "Saved — paste with ⌘V" : "Saved", detail: url.lastPathComponent)
                 }
             } catch {
                 presentError(error)
@@ -277,41 +310,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
 
     nonisolated func sinkDidCapture(frame: CapturedFrame) {
         Task { @MainActor in
-            do { try self.activeSession?.encoder.append(frame) } catch { self.presentError(error) }
+            guard let session = self.activeSession else { return }
+            do {
+                try session.encoder.append(frame)
+            } catch {
+                // Tear the session down *before* reporting. `presentError` runs a
+                // modal, and capture keeps feeding us frames while it is up — the
+                // old order stacked one alert per dropped frame. `stopRecording`
+                // clears `activeSession` synchronously, so the frames already in
+                // flight fall out at the guard above.
+                await self.failRecording(with: error)
+            }
         }
     }
 
     nonisolated func sinkDidFail(with error: Error) {
         Task { @MainActor in
-            self.presentError(error)
-            await self.stopRecording(reason: .discard)
+            await self.failRecording(with: error)
         }
+    }
+
+    private func failRecording(with error: Error) async {
+        await stopRecording(reason: .discard)
+        presentError(error)
     }
 
     // MARK: - Save / countdown / errors
 
-    /// Put the recording on the system clipboard. Writes both the file URL
-    /// (for Finder/Mail) and the raw bytes under the format's UTI (for chat
-    /// apps that paste image/video data directly).
-    private func copyToClipboard(_ url: URL) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
+    /// Confirm we can actually capture before taking over the screen. TCC will not
+    /// grant a live process, so a fresh grant needs a relaunch — say so plainly
+    /// rather than letting the next recording fail with an opaque SCStream error.
+    private func ensureScreenRecordingPermission() -> Bool {
+        if Permissions.hasScreenRecording { return true }
 
-        // File URL — works for Finder, Mail, and anything that accepts a path.
-        (url as NSURL).write(to: pb)
-
-        // Raw data with UTI — works for Slack, Discord, iMessage, browsers.
-        // GIF data is read off the main actor to avoid blocking the UI on large files.
-        guard Settings.shared.outputFormat == .gif else { return }
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let data = try? Data(contentsOf: url) else { return }
-            await self?.writeGifDataToClipboard(data)
+        // The first call raises the system prompt; later ones are no-ops once the
+        // user has chosen. Either way this process still cannot capture — TCC does
+        // not grant a live process — so we explain rather than retry.
+        let granted = Permissions.requestScreenRecording()
+        let alert = NSAlert()
+        if granted {
+            alert.messageText = "Quit and reopen to start recording"
+            alert.informativeText = "macOS applies a new Screen Recording grant only to a fresh launch of \(Self.displayName)."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        } else {
+            alert.messageText = "Screen Recording permission required"
+            alert.informativeText = "Turn on \(Self.displayName) in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen the app."
+            alert.addButton(withTitle: "Open System Settings")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                Permissions.openScreenRecordingSettings()
+            }
         }
+        mainWindow?.makeKeyAndOrderFront(nil)
+        return false
     }
 
-    @MainActor
-    private func writeGifDataToClipboard(_ data: Data) {
-        _ = NSPasteboard.general.setData(data, forType: NSPasteboard.PasteboardType(UTType.gif.identifier))
+    /// The name System Settings lists us under, so permission copy matches what the
+    /// user is actually looking for in that list.
+    nonisolated static var displayName: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
+            ?? "GIF Recorder"
     }
 
     private func presentError(_ error: Error) {
