@@ -175,15 +175,15 @@ final class GifskiEncoder: FrameEncoder {
         // The argument list lives in `arguments` below — adjust as you like.
         // ────────────────────────────────────────────────────────────────────
 
-        let frameFiles: [String]
-        do {
-            frameFiles = (try FileManager.default.contentsOfDirectory(atPath: tempDir.path))
-                .filter { $0.hasPrefix("frame-") && $0.hasSuffix(".png") }
-                .sorted()
-                .map { tempDir.appendingPathComponent($0).path }
-        } catch {
-            throw error
-        }
+        // Every frame is its own argument, and the kernel caps the whole argv at
+        // ARG_MAX (1 MiB on macOS). Passing full temp-directory paths blew that at
+        // roughly 9,000 frames — ten minutes at 15 fps — and the whole recording
+        // died with a cryptic E2BIG. Running gifski *inside* the frame directory
+        // and passing bare filenames stretches the ceiling several-fold; past
+        // that, fail before launch with an explanation rather than after.
+        let frameFiles = (try FileManager.default.contentsOfDirectory(atPath: tempDir.path))
+            .filter { $0.hasPrefix("frame-") && $0.hasSuffix(".png") }
+            .sorted()
 
         guard !frameFiles.isEmpty else { throw EncoderError.noFrames }
 
@@ -194,8 +194,18 @@ final class GifskiEncoder: FrameEncoder {
         ]
         arguments.append(contentsOf: frameFiles)
 
+        // Bytes for each string plus its NUL, plus the pointer table; leave room
+        // for the environment, which counts against the same limit.
+        let argvBytes = arguments.reduce(0) { $0 + $1.utf8.count + 1 + MemoryLayout<UnsafePointer<CChar>>.size }
+        guard argvBytes < Self.maxArgvBytes else {
+            throw NSError(domain: "GifRecorder", code: 11, userInfo: [
+                NSLocalizedDescriptionKey: "This recording has too many frames (\(frameFiles.count)) for gifski to take in one go. Record for less time, lower the framerate, or switch off gifski for long recordings.",
+            ])
+        }
+
         let process = Process()
         process.executableURL = gifskiURL
+        process.currentDirectoryURL = tempDir
         process.arguments = arguments
         let stderr = Pipe()
         process.standardError = stderr
@@ -222,6 +232,10 @@ final class GifskiEncoder: FrameEncoder {
         try? FileManager.default.removeItem(at: tempDir)
         try? FileManager.default.removeItem(at: outputURL)
     }
+
+    /// Conservative share of macOS's 1 MiB ARG_MAX, leaving headroom for the
+    /// environment block.
+    private static let maxArgvBytes = 900 * 1024
 
     /// Look for gifski in (1) the app bundle Resources dir, (2) common Homebrew paths.
     static func locateGifski() -> URL? {
@@ -262,7 +276,11 @@ final class MP4Encoder: FrameEncoder {
             AVVideoWidthKey: Int(pixelSize.width),
             AVVideoHeightKey: Int(pixelSize.height),
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: max(1_000_000, Int(pixelSize.width * pixelSize.height) * 4),
+                // Bits per *second* have to scale with frames per second; the old
+                // formula ignored the framerate entirely, so 5 fps and 60 fps got
+                // the same budget — and a 5K display got ~59 Mbps at any rate.
+                // 0.12 bits per pixel per frame is generous for screen content.
+                AVVideoAverageBitRateKey: max(1_000_000, Int(pixelSize.width * pixelSize.height * CGFloat(framerate) * 0.12)),
                 AVVideoMaxKeyFrameIntervalKey: framerate * 2,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],

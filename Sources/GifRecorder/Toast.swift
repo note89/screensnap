@@ -8,7 +8,9 @@ enum Toast {
     private static var current: NSWindowController?
     private static var dismissTask: Task<Void, Never>?
 
-    static func show(_ headline: String, detail: String? = nil, duration: TimeInterval = 2.2) {
+    /// `reveals`: a file to show in Finder when the toast is clicked. The moment
+    /// the filename is on screen is the moment the user most wants to get at it.
+    static func show(_ headline: String, detail: String? = nil, duration: TimeInterval = 2.2, reveals url: URL? = nil) {
         // Cancel any previous toast so a rapid sequence of recordings doesn't
         // stack windows on top of each other.
         dismissTask?.cancel()
@@ -25,9 +27,16 @@ enum Toast {
         window.hasShadow = true
         window.level = .statusBar
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        window.ignoresMouseEvents = true
+        window.ignoresMouseEvents = (url == nil)
 
-        let bg = NSVisualEffectView(frame: window.contentLayoutRect)
+        let bg = ToastView(frame: window.contentLayoutRect)
+        if let url = url {
+            // Weak: the window owns the view, which owns this closure.
+            bg.onClick = { [weak window] in
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+                window?.orderOut(nil)
+            }
+        }
         bg.material = .hudWindow
         bg.state = .active
         bg.wantsLayer = true
@@ -71,7 +80,7 @@ enum Toast {
         }
 
         let controller = NSWindowController(window: window)
-        controller.showWindow(nil)
+        window.orderFrontRegardless()
         current = controller
 
         // Fade out + close after the duration.
@@ -86,5 +95,19 @@ enum Toast {
                 if Toast.current === controller { Toast.current = nil }
             })
         }
+    }
+}
+
+/// The toast's backdrop. Takes the click that would otherwise only serve to
+/// activate the app — the toast is usually up while another app is frontmost —
+/// and forwards it to `onClick`.
+private final class ToastView: NSVisualEffectView {
+    var onClick: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let onClick = onClick else { return super.mouseUp(with: event) }
+        onClick()
     }
 }

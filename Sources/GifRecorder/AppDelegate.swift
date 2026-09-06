@@ -14,8 +14,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
 
     private var activeSession: RecordingSession?
     private var statusItem: StatusItemController?
+    private var startHotkey: GlobalHotkey?
     private var stopHotkey: GlobalHotkey?
     private var isRecording: Bool { activeSession != nil }
+
+    /// True while `encoder.finish()` runs after a recording stops. For gifski that
+    /// is a process over thousands of PNGs and can take tens of seconds; the HUD
+    /// and menu bar show a "saving" state for the duration instead of going idle.
+    private var isFinishing = false
+
+    /// Set by `applicationShouldTerminate` when the user quits during a recording
+    /// or while one is being saved: `stopRecording` replies once the file is safe.
+    private var replyToTerminateWhenIdle = false
 
     /// True from the moment a capture flow begins until it either starts recording
     /// or backs out. Region selection, the source picker and the countdown all run
@@ -23,18 +33,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
     /// easy to land during a three second countdown — starts a parallel flow that
     /// fights the first one over the HUD and the output file.
     private var isStartingCapture = false
-    private var isBusy: Bool { isRecording || isStartingCapture }
+    private var isBusy: Bool { isRecording || isStartingCapture || isFinishing }
 
     // MARK: - App lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Pin the launch-time permission state before anything can change it.
+        _ = Permissions.hadScreenRecordingAtLaunch
         buildMenu()
         installStatusItem()
-        installGlobalHotkey()
-        showMainWindow()
+        let hotkeys = installGlobalHotkeys()
+        showMainWindow(hotkeysAvailable: hotkeys)
+        if !hotkeys {
+            // Carbon refuses a combination another app already owns. Say so once,
+            // rather than letting the documented shortcut silently do nothing.
+            Toast.show("Keyboard shortcuts unavailable", detail: "⌘⇧6 / ⌘⇧. are taken by another app.", duration: 4)
+        }
     }
 
-    private func installGlobalHotkey() {
+    /// Returns whether both shortcuts registered.
+    private func installGlobalHotkeys() -> Bool {
+        // Cmd+Shift+6 — start a recording in the default capture mode from any
+        // app. Sits next to Apple's own ⌘⇧5 capture UI.
+        startHotkey = GlobalHotkey(
+            keyCode: kVK_ANSI_6,
+            modifiers: cmdKey | shiftKey
+        ) { [weak self] in
+            Task { @MainActor in self?.beginCaptureFlow() }
+        }
+
         // Cmd+Shift+. — backs out of the countdown before a recording has started,
         // and finishes the recording once it has. The countdown panel is
         // non-activating and rarely holds the keyboard, so this is the only way to
@@ -49,6 +76,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
                 await self.stopRecording(reason: .finish)
             }
         }
+
+        let ok = startHotkey != nil && stopHotkey != nil
+        if !ok {
+            FileHandle.standardError.write(Data("[GifRecorder] global hotkey registration failed\n".utf8))
+        }
+        return ok
     }
 
     private func installStatusItem() {
@@ -89,9 +122,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
     // the menu bar's Quit item.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    /// Clicking the Dock icon after the launcher was closed used to do nothing:
+    /// there is no Window menu, and the only way back was the menu bar item.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag, !isBusy {
+            mainWindow?.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    /// Quitting mid-recording used to discard it without a word — both Quit items
+    /// were wired straight to `NSApplication.terminate`. Offer to finish first,
+    /// and if a save is already in flight, let it land before exiting.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isFinishing {
+            replyToTerminateWhenIdle = true
+            return .terminateLater
+        }
+        guard isRecording else {
+            // A countdown or picker that has not produced a frame yet has nothing
+            // on disk worth keeping.
+            CountdownOverlay.cancelIfRunning()
+            return .terminateNow
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "A recording is in progress"
+        alert.informativeText = "Finish and save it, or discard it and quit?"
+        alert.addButton(withTitle: "Finish and Save")
+        alert.addButton(withTitle: "Discard and Quit")
+        alert.addButton(withTitle: "Cancel")
+        let reason: StopReason
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: reason = .finish
+        case .alertSecondButtonReturn: reason = .discard
+        default: return .terminateCancel
+        }
+        replyToTerminateWhenIdle = true
+        Task { await stopRecording(reason: reason) }
+        return .terminateLater
+    }
+
     // MARK: - Main window
 
-    private func showMainWindow() {
+    private func showMainWindow(hotkeysAvailable: Bool) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 460),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -104,7 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         // the launcher follows them rather than yanking them to its Space.
         // Lets you record sections of different workspaces without losing context.
         window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        window.contentView = MainView(start: { [weak self] in self?.beginCaptureFlow() })
+        window.contentView = MainView(hotkeysAvailable: hotkeysAvailable, start: { [weak self] in self?.beginCaptureFlow() })
         window.makeKeyAndOrderFront(nil)
         self.mainWindow = window
     }
@@ -273,16 +347,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
         guard let session = activeSession else { return }
         activeSession = nil
         await session.recorder.stop()
-        session.controlBar.hide()
-        statusItem?.setState(.idle)
 
         switch reason {
         case .discard:
+            session.controlBar.hide()
+            statusItem?.setState(.idle)
             session.encoder.cancel()
             mainWindow?.makeKeyAndOrderFront(nil)
+
         case .finish:
+            // Keep the HUD and the menu bar dot up, in a distinct "saving" state,
+            // until the file is really on disk. Tearing them down first left the
+            // app looking idle for however long the encoder took — for gifski,
+            // tens of seconds — with no hint anything was still happening.
+            isFinishing = true
+            session.controlBar.showSaving()
+            statusItem?.setState(.saving)
+            let saved: Result<URL, Error>
             do {
-                let url = try await session.encoder.finish()
+                saved = .success(try await session.encoder.finish())
+            } catch {
+                saved = .failure(error)
+            }
+            isFinishing = false
+            session.controlBar.hide()
+            statusItem?.setState(.idle)
+
+            switch saved {
+            case .success(let url):
                 // No save dialog — the file is already on disk in the save folder
                 // with a unique timestamped name. Copy to clipboard, remember it
                 // as the "last recording" so the user can rename later if they want.
@@ -298,11 +390,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
                 // Optional toast so the user knows it landed somewhere. Only promise
                 // a paste when we actually put something on the pasteboard.
                 if Settings.shared.showNotification {
-                    Toast.show(copied ? "Saved — paste with ⌘V" : "Saved", detail: url.lastPathComponent)
+                    Toast.show(copied ? "Saved — paste with ⌘V" : "Saved", detail: url.lastPathComponent, reveals: url)
                 }
-            } catch {
+            case .failure(let error):
                 presentError(error)
             }
+        }
+
+        if replyToTerminateWhenIdle {
+            replyToTerminateWhenIdle = false
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
     }
 
@@ -341,18 +438,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, FrameSink {
     /// grant a live process, so a fresh grant needs a relaunch — say so plainly
     /// rather than letting the next recording fail with an opaque SCStream error.
     private func ensureScreenRecordingPermission() -> Bool {
-        if Permissions.hasScreenRecording { return true }
+        if Permissions.canCaptureNow { return true }
 
-        // The first call raises the system prompt; later ones are no-ops once the
-        // user has chosen. Either way this process still cannot capture — TCC does
-        // not grant a live process — so we explain rather than retry.
-        let granted = Permissions.requestScreenRecording()
+        if !Permissions.hasScreenRecording {
+            // The first call raises the system prompt; later ones are no-ops once
+            // the user has chosen.
+            Permissions.requestScreenRecording()
+        }
+
         let alert = NSAlert()
-        if granted {
+        if Permissions.hasScreenRecording {
+            // Granted, but after launch — so not to this process.
             alert.messageText = "Quit and reopen to start recording"
             alert.informativeText = "macOS applies a new Screen Recording grant only to a fresh launch of \(Self.displayName)."
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+            if Permissions.canRelaunch {
+                alert.addButton(withTitle: "Relaunch Now")
+                alert.addButton(withTitle: "Later")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    Permissions.relaunch()
+                }
+            } else {
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
         } else {
             alert.messageText = "Screen Recording permission required"
             alert.informativeText = "Turn on \(Self.displayName) in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen the app."

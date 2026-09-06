@@ -19,6 +19,7 @@ struct SelectedRegion {
 final class RegionSelector {
     private var overlays: [OverlayWindow] = []
     private var completion: ((SelectedRegion?) -> Void)?
+    private var escapeMonitor: Any?
 
     func begin(completion: @escaping (SelectedRegion?) -> Void) {
         self.completion = completion
@@ -33,9 +34,21 @@ final class RegionSelector {
         }
         // Promote first overlay to key so it gets keyboard events (Esc to cancel).
         overlays.first?.makeKey()
+        // Only one overlay can be key, so the panel's own keyDown only ever saw
+        // Escape on that one display. A local monitor sees every key event while
+        // we are the active app, whichever screen the cursor is on.
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53 /* esc */ else { return event }
+            self?.finish(with: nil)
+            return nil
+        }
     }
 
     fileprivate func finish(with region: SelectedRegion?) {
+        if let monitor = escapeMonitor {
+            NSEvent.removeMonitor(monitor)
+            escapeMonitor = nil
+        }
         for overlay in overlays { overlay.orderOut(nil) }
         overlays.removeAll()
         let cb = completion
@@ -162,10 +175,14 @@ private final class SelectionView: NSView {
     override func mouseUp(with event: NSEvent) {
         guard let rect = currentRect() else { onCancel?(); return }
 
-        // TODO(user): decide minimum-size policy. For now we reject anything
-        //             smaller than 10x10 points and commit the rest verbatim.
+        // Minimum-size policy: anything under 10×10 pt is treated as a slipped
+        // click. Reset and stay up so the user can try again — this used to
+        // cancel the whole flow and drop them back at the launcher with no
+        // explanation. Escape is the way out, and the hint says so.
         if rect.width < 10 || rect.height < 10 {
-            onCancel?()
+            dragOrigin = nil
+            dragCurrent = nil
+            needsDisplay = true
             return
         }
         onCommit?(rect)
@@ -180,7 +197,10 @@ private final class SelectionView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let rect = currentRect() else { return }
+        guard let rect = currentRect() else {
+            drawHint()
+            return
+        }
         // Carve a hole in the dim overlay so the user sees what they're selecting.
         NSColor.clear.setFill()
         rect.fill(using: .copy)
@@ -191,6 +211,27 @@ private final class SelectionView: NSView {
         path.stroke()
         // Live dimensions.
         drawDimensions(in: rect)
+    }
+
+    /// The overlay used to appear with no explanation at all — just a dimmed
+    /// screen and a crosshair. Shown until the first drag begins.
+    private func drawHint() {
+        let text = "Drag to select the area to record   ·   esc to cancel"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let size = (text as NSString).size(withAttributes: attrs)
+        let pad: CGFloat = 14
+        let bgRect = NSRect(
+            x: bounds.midX - size.width / 2 - pad,
+            y: bounds.maxY - 96,
+            width: size.width + pad * 2,
+            height: size.height + pad
+        )
+        NSColor.black.withAlphaComponent(0.7).setFill()
+        NSBezierPath(roundedRect: bgRect, xRadius: 8, yRadius: 8).fill()
+        (text as NSString).draw(at: NSPoint(x: bgRect.minX + pad, y: bgRect.minY + pad / 2), withAttributes: attrs)
     }
 
     private func drawDimensions(in rect: NSRect) {

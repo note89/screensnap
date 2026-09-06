@@ -4,12 +4,13 @@ import AppKit
 /// shows on every screen and every Space, regardless of the recording
 /// region or which app is frontmost.
 ///
-/// Two states:
+/// Three states:
 ///   .idle      — small camera icon, click to open the launcher window.
 ///   .recording — pulsing red dot, click reveals Stop / Cancel.
+///   .saving    — steady amber dot while the encoder writes the file.
 @MainActor
 final class StatusItemController: NSObject {
-    enum State { case idle, recording }
+    enum State { case idle, recording, saving }
 
     private let item: NSStatusItem
     private let menu = NSMenu()
@@ -122,44 +123,52 @@ final class StatusItemController: NSObject {
     }
 
     func setState(_ state: State) {
-        stopItem.isHidden   = (state == .idle)
-        cancelItem.isHidden = (state == .idle)
-        recordRegionItem.isHidden  = (state == .recording)
-        recordDisplayItem.isHidden = (state == .recording)
-        recordWindowItem.isHidden  = (state == .recording)
+        // Stop / Cancel only make sense mid-recording; the direct-record items
+        // only when nothing is in flight at all.
+        stopItem.isHidden   = (state != .recording)
+        cancelItem.isHidden = (state != .recording)
+        recordRegionItem.isHidden  = (state != .idle)
+        recordDisplayItem.isHidden = (state != .idle)
+        recordWindowItem.isHidden  = (state != .idle)
+
+        pulseTimer?.invalidate()
+        pulseTimer = nil
+        pulseOn = true
 
         switch state {
         case .idle:
-            pulseTimer?.invalidate()
-            pulseTimer = nil
-            pulseOn = true
-            renderIcon(recording: false, on: true)
+            renderIcon(.idle, on: true)
+        case .saving:
+            renderIcon(.saving, on: true)
         case .recording:
             // Pulse the red dot at ~1Hz so it's eye-catching from the menu bar.
-            pulseTimer?.invalidate()
-            pulseOn = true
-            renderIcon(recording: true, on: pulseOn)
+            renderIcon(.recording, on: pulseOn)
             pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
                 guard let self = self else { return }
                 Task { @MainActor [self] in
                     self.pulseOn.toggle()
-                    self.renderIcon(recording: true, on: self.pulseOn)
+                    self.renderIcon(.recording, on: self.pulseOn)
                 }
             }
         }
     }
 
-    private func renderIcon(recording: Bool, on: Bool) {
+    private func renderIcon(_ state: State, on: Bool) {
         let size = NSSize(width: 18, height: 18)
         let img = NSImage(size: size, flipped: false) { rect in
-            if recording {
+            switch state {
+            case .recording:
                 // Solid red circle (pulses by alpha).
                 let color = on
                     ? NSColor.systemRed
                     : NSColor.systemRed.withAlphaComponent(0.4)
                 color.setFill()
                 NSBezierPath(ovalIn: rect.insetBy(dx: 4, dy: 4)).fill()
-            } else {
+            case .saving:
+                // Steady amber: something is still happening, but no longer capturing.
+                NSColor.systemOrange.setFill()
+                NSBezierPath(ovalIn: rect.insetBy(dx: 4, dy: 4)).fill()
+            case .idle:
                 // Outlined camera-ish circle for idle.
                 NSColor.labelColor.setStroke()
                 let p = NSBezierPath(ovalIn: rect.insetBy(dx: 4, dy: 4))
@@ -170,11 +179,15 @@ final class StatusItemController: NSObject {
             }
             return true
         }
-        // For non-recording state, treat as template so the system tints it
-        // correctly in dark/light menu bars.
-        img.isTemplate = !recording
+        // Only the idle glyph is a template, so the system tints it correctly in
+        // dark/light menu bars; the coloured dots must keep their colour.
+        img.isTemplate = (state == .idle)
         item.button?.image = img
-        item.button?.toolTip = recording ? "Recording — click to finish" : "GIF Recorder"
+        switch state {
+        case .recording: item.button?.toolTip = "Recording — click to finish"
+        case .saving:    item.button?.toolTip = "Saving recording…"
+        case .idle:      item.button?.toolTip = "GIF Recorder"
+        }
     }
 
     @objc private func openMain() { onShowMainWindow?() }

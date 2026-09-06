@@ -9,6 +9,8 @@ final class MainView: NSView {
     private let modePicker = NSPopUpButton()
     private let permissionStatus = NSTextField(labelWithString: "")
     private let requestPermissionButton = NSButton(title: "Grant Screen Recording Access", target: nil, action: nil)
+    private let relaunchButton = NSButton(title: "Relaunch", target: nil, action: nil)
+    private let shortcutsLabel = NSTextField(labelWithString: "")
     private var permissionTimer: Timer?
     private let framerateField = NSTextField()
     private let downsampleField = NSTextField()
@@ -22,10 +24,16 @@ final class MainView: NSView {
     private let revealButton = NSButton(title: "Show in Finder", target: nil, action: nil)
     private let copyAgainButton = NSButton(title: "Copy again", target: nil, action: nil)
 
-    init(start: @escaping () -> Void) {
+    /// `hotkeysAvailable` is false when Carbon refused one of our global shortcuts
+    /// (another app owns it); the caption under Record says so instead of
+    /// advertising keys that do nothing.
+    init(hotkeysAvailable: Bool, start: @escaping () -> Void) {
         self.onStart = start
         super.init(frame: .zero)
         build()
+        shortcutsLabel.stringValue = hotkeysAvailable
+            ? "⌘⇧6 records from anywhere  ·  ⌘⇧. finishes, or cancels the countdown"
+            : "Global shortcuts unavailable — another app owns ⌘⇧6 or ⌘⇧."
         loadFromSettings()
         refreshPermissionStatus()
         refreshLastRecording()
@@ -105,9 +113,16 @@ final class MainView: NSView {
         requestPermissionButton.bezelStyle = .rounded
         requestPermissionButton.target = self
         requestPermissionButton.action = #selector(requestPermissionTapped)
-        let permissionRow = NSStackView(views: [permissionStatus, requestPermissionButton])
+        relaunchButton.bezelStyle = .rounded
+        relaunchButton.target = self
+        relaunchButton.action = #selector(relaunchTapped)
+        relaunchButton.isHidden = true
+        let permissionRow = NSStackView(views: [permissionStatus, requestPermissionButton, relaunchButton])
         permissionRow.orientation = .horizontal
         permissionRow.spacing = 8
+
+        shortcutsLabel.font = .systemFont(ofSize: 11)
+        shortcutsLabel.textColor = .secondaryLabelColor
 
         let formRow0 = labeledRow("Capture", control: modePicker)
         let formRow1 = labeledRow("Format", control: formatPicker)
@@ -148,7 +163,7 @@ final class MainView: NSView {
             NSBox.separator(),
             title, formRow0, formRow1, formRow2, formRow3, formRow4,
             cursorCheckbox, gifskiCheckbox, clipboardCheckbox, revealCheckbox,
-            recordButton,
+            recordButton, shortcutsLabel,
             NSBox.separator(),
             lastRow,
         ])
@@ -235,9 +250,26 @@ final class MainView: NSView {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let stem = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !stem.isEmpty else { return }
+        // "/" would turn the name into a path, and ":" is what Finder shows a
+        // slash as; both used to fall through to a raw NSFileManager error.
+        guard !stem.contains("/"), !stem.contains(":") else {
+            let bad = NSAlert()
+            bad.messageText = "That name can't be used"
+            bad.informativeText = "File names can't contain \"/\" or \":\"."
+            bad.runModal()
+            return
+        }
         let newURL = url.deletingLastPathComponent()
             .appendingPathComponent(stem)
             .appendingPathExtension(url.pathExtension)
+        guard newURL != url else { return }
+        guard !FileManager.default.fileExists(atPath: newURL.path) else {
+            let taken = NSAlert()
+            taken.messageText = "\"\(newURL.lastPathComponent)\" already exists"
+            taken.informativeText = "Choose a different name."
+            taken.runModal()
+            return
+        }
         do {
             try FileManager.default.moveItem(at: url, to: newURL)
             Settings.shared.lastRecordingURL = newURL
@@ -274,15 +306,32 @@ final class MainView: NSView {
         Permissions.openScreenRecordingSettings()
     }
 
+    @objc private func relaunchTapped() {
+        Permissions.relaunch()
+    }
+
     private func refreshPermissionStatus() {
-        let ok = Permissions.hasScreenRecording
-        permissionStatus.stringValue = ok
-            ? "Screen Recording: ✅ granted"
-            : "Screen Recording: ❌ not granted — enable \(AppDelegate.displayName)"
-        permissionStatus.textColor = ok ? .systemGreen : .systemRed
-        // Hide the action buttons once we're good — keeps the launcher tidy.
-        requestPermissionButton.isHidden = ok
-        if ok {
+        if Permissions.canCaptureNow {
+            permissionStatus.stringValue = "Screen Recording: ✅ granted"
+            permissionStatus.textColor = .systemGreen
+            requestPermissionButton.isHidden = true
+            relaunchButton.isHidden = true
+        } else if Permissions.needsRelaunch {
+            // TCC flipped to granted while we were running. This label used to
+            // turn green at that moment, in a process that still could not
+            // capture a single frame.
+            permissionStatus.stringValue = "Screen Recording: ✅ granted — quit and reopen to record"
+            permissionStatus.textColor = .systemOrange
+            requestPermissionButton.isHidden = true
+            relaunchButton.isHidden = !Permissions.canRelaunch
+        } else {
+            permissionStatus.stringValue = "Screen Recording: ❌ not granted — enable \(AppDelegate.displayName)"
+            permissionStatus.textColor = .systemRed
+            requestPermissionButton.isHidden = false
+            relaunchButton.isHidden = true
+        }
+        // Nothing left to poll for once TCC has answered either way.
+        if Permissions.hasScreenRecording {
             permissionTimer?.invalidate()
             permissionTimer = nil
         }

@@ -31,8 +31,7 @@ enum CaptureSource {
             let scale = NSScreen.screens.first(where: { $0.displayID == d.displayID })?.backingScaleFactor ?? 2
             return CGSize(width: CGFloat(d.width) * scale, height: CGFloat(d.height) * scale)
         case .window(let w):
-            let midPoint = CGPoint(x: w.frame.midX, y: w.frame.midY)
-            let scale = NSScreen.screens.first(where: { $0.frame.contains(midPoint) })?.backingScaleFactor ?? 2
+            let scale = screen?.backingScaleFactor ?? 2
             return CGSize(width: w.frame.width * scale, height: w.frame.height * scale)
         }
     }
@@ -52,23 +51,37 @@ enum CaptureSource {
         )
     }
 
-    /// The screen this capture comes from, so the countdown can appear where the
-    /// user is looking. nil for window capture: `SCWindow.frame` is in top-left CG
-    /// coordinates and matching it against `NSScreen.frame` needs a conversion we
-    /// don't do anywhere else.
+    /// The screen this capture comes from, so the countdown and HUD can appear
+    /// where the user is looking, and so the right backing scale is used.
     var screen: NSScreen? {
         switch self {
         case .region(let r):
             return NSScreen.screens.first { $0.displayID == r.displayID }
         case .display(let d):
             return NSScreen.screens.first { $0.displayID == d.displayID }
-        case .window:
-            return nil
+        case .window(let w):
+            return NSScreen.screen(containingCGPoint: CGPoint(x: w.frame.midX, y: w.frame.midY))
         }
     }
 
     private static func evenPixels(_ value: CGFloat) -> CGFloat {
         max(2, (value / 2).rounded(.down) * 2)
+    }
+}
+
+extension NSScreen {
+    /// The screen under a point given in CoreGraphics screen coordinates — origin
+    /// at the top-left of the primary display, y growing downward — which is how
+    /// `SCWindow.frame` is expressed. `NSScreen.frame` has its origin bottom-left
+    /// with y growing upward. The two only coincide on a single-display setup,
+    /// which is why the old `frame.contains(midPoint)` lookup chose the wrong
+    /// scale factor for windows on a secondary monitor.
+    static func screen(containingCGPoint point: CGPoint) -> NSScreen? {
+        // Index 0 is always the primary display, whose origin is (0, 0) in both
+        // coordinate systems.
+        guard let primary = screens.first else { return nil }
+        let flipped = CGPoint(x: point.x, y: primary.frame.height - point.y)
+        return screens.first { $0.frame.contains(flipped) }
     }
 }
 

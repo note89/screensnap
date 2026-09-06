@@ -1,7 +1,10 @@
 import AppKit
 
 /// Tiny floating HUD shown while recording. One stop button + an elapsed timer.
+/// After Finish it stays up in a "Saving…" state until the encoder is done.
 final class ControlBarController: NSWindowController {
+    private let dot = NSView(frame: .zero)
+    private let spinner = NSProgressIndicator()
     private let timerLabel = NSTextField(labelWithString: "00:00")
     private let stopButton = NSButton(title: "Finish", target: nil, action: nil)
     private let cancelButton = NSButton(title: "✕", target: nil, action: nil)
@@ -42,10 +45,14 @@ final class ControlBarController: NSWindowController {
     private func configureLayout() {
         guard let contentView = window?.contentView else { return }
 
-        let dot = NSView(frame: .zero)
         dot.wantsLayer = true
         dot.layer?.backgroundColor = NSColor.systemRed.cgColor
         dot.layer?.cornerRadius = 5
+
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        spinner.isHidden = true
 
         timerLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         timerLabel.alignment = .left
@@ -61,7 +68,7 @@ final class ControlBarController: NSWindowController {
         cancelButton.toolTip = "Discard this recording"
         stopButton.toolTip = "Finish and save (⌘⇧.)"
 
-        for v in [dot, timerLabel, stopButton, cancelButton] {
+        for v in [dot, spinner, timerLabel, stopButton, cancelButton] {
             v.translatesAutoresizingMaskIntoConstraints = false
             contentView.addSubview(v)
         }
@@ -71,6 +78,12 @@ final class ControlBarController: NSWindowController {
             dot.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
             dot.widthAnchor.constraint(equalToConstant: 10),
             dot.heightAnchor.constraint(equalToConstant: 10),
+
+            // The spinner takes the dot's place while saving.
+            spinner.centerXAnchor.constraint(equalTo: dot.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
+            spinner.widthAnchor.constraint(equalToConstant: 16),
+            spinner.heightAnchor.constraint(equalToConstant: 16),
 
             timerLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 8),
             timerLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
@@ -118,9 +131,24 @@ final class ControlBarController: NSWindowController {
         tick()
     }
 
+    /// Swap the recording controls for a "Saving…" indicator. The recording has
+    /// stopped, so the elapsed clock freezes and both buttons go away — there is
+    /// nothing left to finish or discard.
+    func showSaving() {
+        timer?.invalidate()
+        timer = nil
+        timerLabel.stringValue = "Saving…"
+        dot.isHidden = true
+        stopButton.isHidden = true
+        cancelButton.isHidden = true
+        spinner.isHidden = false
+        spinner.startAnimation(nil)
+    }
+
     func hide() {
         timer?.invalidate()
         timer = nil
+        spinner.stopAnimation(nil)
         window?.orderOut(nil)
     }
 
