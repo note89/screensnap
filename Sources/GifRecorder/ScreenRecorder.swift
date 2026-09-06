@@ -119,16 +119,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let display = content.displays.first(where: { $0.displayID == region.displayID }) else {
                 throw ScreenRecorderError.displayNotFound
             }
-            let excluded = content.windows.filter { excludeWindowIDs.contains($0.windowID) }
             config.sourceRect = region.pixelRect
             config.width = Int(region.pixelRect.width)
             config.height = Int(region.pixelRect.height)
             pixelSize = region.pixelRect.size
-            filter = SCContentFilter(display: display, excludingWindows: excluded)
+            filter = Self.displayFilter(display: display, content: content, excludeWindowIDs: excludeWindowIDs)
 
         case .display(let display):
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            let excluded = content.windows.filter { excludeWindowIDs.contains($0.windowID) }
             // Find the NSScreen matching this display for correct Retina scale
             let scale = NSScreen.screens.first(where: {
                 ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID
@@ -138,7 +136,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             config.width = w
             config.height = h
             pixelSize = CGSize(width: w, height: h)
-            filter = SCContentFilter(display: display, excludingWindows: excluded)
+            filter = Self.displayFilter(display: display, content: content, excludeWindowIDs: excludeWindowIDs)
 
         case .window(let window):
             // `desktopIndependentWindow` captures the window across Space changes
@@ -161,6 +159,19 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         isCapturingFlag.withLock { $0 = true }
         self.captureState = .capturing(stream: stream)
+    }
+
+    /// Excludes every window belonging to this process (control bar, toast, countdown),
+    /// plus any explicit IDs. Matching by PID is robust to the HUD not yet being listed
+    /// in shareable content when the filter is built.
+    private static func displayFilter(display: SCDisplay, content: SCShareableContent, excludeWindowIDs: [CGWindowID]) -> SCContentFilter {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let ownApps = content.applications.filter { $0.processID == pid }
+        if ownApps.isEmpty {
+            let excludedWindows = content.windows.filter { excludeWindowIDs.contains($0.windowID) }
+            return SCContentFilter(display: display, excludingWindows: excludedWindows)
+        }
+        return SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
     }
 
     func stop() async {
