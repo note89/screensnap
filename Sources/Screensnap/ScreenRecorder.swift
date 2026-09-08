@@ -9,6 +9,10 @@ import ScreenCaptureKit
 struct CapturedFrame {
     let image: CGImage
     let timestamp: CFTimeInterval
+    /// Absolute host-clock time (`CACurrentMediaTime()` base) of the sample.
+    /// Microphone sample buffers carry PTS on the same clock, so the encoder
+    /// uses this to line the audio track up with the video track.
+    let hostTime: CFTimeInterval
 }
 
 /// What to capture. Each case maps to a different `SCContentFilter` constructor.
@@ -28,9 +32,7 @@ enum CaptureSource {
         case .region(let r):
             return r.pixelRect.size
         case .display(let d):
-            let scale = NSScreen.screens.first(where: {
-                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == d.displayID
-            })?.backingScaleFactor ?? 2
+            let scale = NSScreen.screen(displayID: d.displayID)?.backingScaleFactor ?? 2
             return CGSize(width: CGFloat(d.width) * scale, height: CGFloat(d.height) * scale)
         case .window(let w):
             let midPoint = CGPoint(x: w.frame.midX, y: w.frame.midY)
@@ -38,8 +40,30 @@ enum CaptureSource {
             return CGSize(width: w.frame.width * scale, height: w.frame.height * scale)
         }
     }
+
+    /// Where the captured area sits on screen, in AppKit points (bottom-left origin).
+    /// The facecam preview compares its own frame against this to place the bubble.
+    var screenFrame: CGRect {
+        switch self {
+        case .region(let r):
+            guard let screen = NSScreen.screen(displayID: r.displayID) else { return .zero }
+            let scale = screen.backingScaleFactor
+            return CGRect(
+                x: screen.frame.minX + r.pixelRect.minX / scale,
+                y: screen.frame.maxY - r.pixelRect.maxY / scale,
+                width: r.pixelRect.width / scale,
+                height: r.pixelRect.height / scale
+            )
+        case .display(let d):
+            return NSScreen.screen(displayID: d.displayID)?.frame ?? .zero
+        case .window(let w):
+            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+            return CGRect(x: w.frame.minX, y: primaryHeight - w.frame.maxY, width: w.frame.width, height: w.frame.height)
+        }
+    }
 }
 
+@MainActor
 protocol FrameSink: AnyObject {
     func sinkDidCapture(frame: CapturedFrame)
     func sinkDidFail(with error: Error)
@@ -55,7 +79,7 @@ enum StopReason {
     case discard
 }
 
-/// Wraps `SCStream` for region capture. Owns the recording lifecycle and
+/// Wraps `SCStream`. Owns the recording lifecycle and
 /// throttles the irregular SCK frame stream onto a stable output framerate
 /// before forwarding frames to the sink.
 @MainActor
@@ -77,7 +101,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         case stopped
     }
     private var captureState: CaptureState = .idle
-    private let frameQueue = DispatchQueue(label: "GifRecorder.frameQueue")
+    private let frameQueue = DispatchQueue(label: "Screensnap.frameQueue")
 
     private let throttle = OSAllocatedUnfairLock(
         initialState: FrameThrottle(startHostTime: 0, lastEmittedTime: -.infinity))
@@ -128,9 +152,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         case .display(let display):
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             // Find the NSScreen matching this display for correct Retina scale
-            let scale = NSScreen.screens.first(where: {
-                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID
-            }).map { $0.backingScaleFactor } ?? 2
+            let scale = NSScreen.screen(displayID: display.displayID)?.backingScaleFactor ?? 2
             let w = Int(Double(display.width) * scale)
             let h = Int(Double(display.height) * scale)
             config.width = w
@@ -161,7 +183,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         self.captureState = .capturing(stream: stream)
     }
 
-    /// Excludes every window belonging to this process (control bar, toast, countdown),
+    /// Excludes every window belonging to this process (HUD pill, facecam preview),
     /// plus any explicit IDs. Matching by PID is robust to the HUD not yet being listed
     /// in shareable content when the filter is built.
     private static func displayFilter(display: SCDisplay, content: SCShareableContent, excludeWindowIDs: [CGWindowID]) -> SCContentFilter {
@@ -197,42 +219,19 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
         guard isCapturingFlag.withLock({ $0 }) else { return }
 
-        // ── User contribution point #2 ──────────────────────────────────────
-        // We need to map SCStream's irregular frame stream (fires whenever
-        // the screen actually updates) onto our requested output framerate.
-        //
-        // The simplest policy — the one below — is "drop frames that arrive
-        // sooner than 1/framerate after the last accepted frame." That's
-        // fine for screencasts of UI motion but it has a subtle issue: if
-        // the screen is *static*, no frames arrive at all, and the GIF will
-        // hold the last frame for an arbitrarily long period.
-        //
-        // Other policies you might pick:
-        //   (a) "Drop-newest" + a heartbeat timer that re-emits the last
-        //       frame if nothing has arrived for >2× the interval. Keeps
-        //       the GIF timeline honest during static moments.
-        //   (b) Buffer the latest frame and emit on a fixed CADisplayLink-
-        //       style timer. Decouples capture rate from emit rate.
-        //   (c) Emit every frame as it arrives and let the encoder set
-        //       per-frame durations from the actual host-time deltas.
-        //       Most accurate timing, but variable file size / encoder load.
-        //
-        // Pick the policy that matches how you'll use this app. The current
-        // implementation is (a-without-the-heartbeat) — fine for the MVP.
-        // ────────────────────────────────────────────────────────────────────
 
-        let (shouldEmit, elapsed) = throttle.withLock { state -> (Bool, CFTimeInterval) in
+        let (shouldEmit, elapsed, hostTime) = throttle.withLock { state -> (Bool, CFTimeInterval, CFTimeInterval) in
             let now = CACurrentMediaTime()
             let e = now - state.startHostTime
             let interval = 1.0 / Double(framerate)
-            guard e - state.lastEmittedTime >= interval else { return (false, e) }
+            guard e - state.lastEmittedTime >= interval else { return (false, e, now) }
             state.lastEmittedTime = e
-            return (true, e)
+            return (true, e, now)
         }
         guard shouldEmit else { return }
 
         guard let cgImage = sampleBuffer.cgImage() else { return }
-        let frame = CapturedFrame(image: cgImage, timestamp: elapsed)
+        let frame = CapturedFrame(image: cgImage, timestamp: elapsed, hostTime: hostTime)
         Task { @MainActor [weak self] in
             self?.sink?.sinkDidCapture(frame: frame)
         }

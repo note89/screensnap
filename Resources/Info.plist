@@ -3,25 +3,31 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleDisplayName</key>
-    <string>GIF Recorder</string>
+    <string>Screensnap</string>
     <key>CFBundleExecutable</key>
-    <string>GifRecorder</string>
+    <string>Screensnap</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>local.gifrecorder</string>
+    <string>local.screensnap</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>GIF Recorder</string>
+    <string>Screensnap</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>Shows your face in a round bubble on screen recordings.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Records your voice into MP4 screen recordings.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>

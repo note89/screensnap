@@ -6,14 +6,14 @@
 # Screen Recording permission once and it survives every future rebuild.
 #
 # To remove the cert later:
-#   security delete-certificate -c "GifRecorder Dev"
+#   security delete-certificate -c "Screensnap Dev"
 #
 # To check it exists:
-#   security find-certificate -c "GifRecorder Dev"
+#   security find-certificate -c "Screensnap Dev"
 
 set -euo pipefail
 
-CERT_NAME="GifRecorder Dev"
+CERT_NAME="Screensnap Dev"
 
 if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
     echo "✓ Certificate '$CERT_NAME' already exists in your login keychain."
@@ -21,7 +21,7 @@ if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
     exit 0
 fi
 
-WORK_DIR="$(mktemp -d -t gifrecorder-signing-XXXX)"
+WORK_DIR="$(mktemp -d -t screensnap-signing-XXXX)"
 trap "rm -rf '$WORK_DIR'" EXIT
 cd "$WORK_DIR"
 

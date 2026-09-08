@@ -18,3 +18,6 @@ DerivedData/
 
 # Claude Code project files
 .claude/
+
+# Screenshots are committed; scratch renders are not
+docs/*.mov

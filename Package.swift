@@ -1,16 +1,16 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 5.10
 import PackageDescription
 
 let package = Package(
-    name: "GifRecorder",
-    platforms: [.macOS(.v13)],
+    name: "Screensnap",
+    platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "GifRecorder", targets: ["GifRecorder"])
+        .executable(name: "Screensnap", targets: ["Screensnap"])
     ],
     targets: [
         .executableTarget(
-            name: "GifRecorder",
-            path: "Sources/GifRecorder"
+            name: "Screensnap",
+            path: "Sources/Screensnap"
         )
     ]
 )

@@ -110,7 +110,11 @@ private final class OverlayWindow: NSPanel {
     }
 }
 
-private extension NSScreen {
+extension NSScreen {
+    static func screen(displayID: CGDirectDisplayID) -> NSScreen? {
+        screens.first { $0.displayID == displayID }
+    }
+
     var displayID: CGDirectDisplayID {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
             ?? CGMainDisplayID()
