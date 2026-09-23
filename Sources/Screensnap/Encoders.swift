@@ -25,7 +25,7 @@ struct EncoderSetup {
     static func make(output: Output, url: URL, framerate: Int, pixelSize: CGSize, audio: AudioTrack) throws -> EncoderSetup {
         switch output {
         case .gif(.fast):
-            return EncoderSetup(encoder: ImageIOGifEncoder(outputURL: url, framerate: framerate), audioChannel: nil)
+            return EncoderSetup(encoder: try ImageIOGifEncoder(outputURL: url), audioChannel: nil)
         case .gif(.best):
             return EncoderSetup(encoder: try GifskiEncoder(outputURL: url, framerate: framerate, quality: GifskiEncoder.defaultQuality), audioChannel: nil)
         case .mp4:
@@ -47,80 +47,102 @@ final class ImageIOGifEncoder: FrameEncoder {
         case dropped
     }
 
-    /// Frames handed to the encode queue and not yet encoded, and the first encode error.
-    private struct Intake {
+    /// How many frames wait on the encode queue, or the error that ended encoding.
+    private enum Intake {
         /// A full-screen Retina frame is ~24 MB and takes ~70 ms to quantize, so a short
         /// queue only absorbs jitter.
         static let maxBacklog = 3
 
-        var backlog = 0
-        var failure: Error?
+        case accepting(backlog: Int)
+        case failed(Error)
 
         mutating func admit() throws -> Admission {
-            if let failure { throw failure }
-            guard backlog < Self.maxBacklog else { return .dropped }
-            backlog += 1
-            return .queued
+            switch self {
+            case .failed(let error):
+                throw error
+            case .accepting(let backlog):
+                guard backlog < Self.maxBacklog else { return .dropped }
+                self = .accepting(backlog: backlog + 1)
+                return .queued
+            }
+        }
+
+        mutating func settle(_ outcome: Result<Void, Error>) {
+            guard case .accepting(let backlog) = self else { return }
+            switch outcome {
+            case .success: self = .accepting(backlog: backlog - 1)
+            case .failure(let error): self = .failed(error)
+            }
         }
     }
 
     private enum EncoderState {
-        case active
-        case finished
-        case cancelled
+        case waitingForFirstFrame
+        /// `startHostTime` is the host-clock moment the recording's timeline starts.
+        case recording(startHostTime: CFTimeInterval)
+        case closed
     }
 
     private let outputURL: URL
-    /// Touched only on `encodeQueue`.
-    private let stream: GIFFrameStream
+    private let stream: QueueConfined<GIFFrameStream>
     private let encodeQueue = DispatchQueue(label: "Screensnap.gifEncode", qos: .userInitiated, autoreleaseFrequency: .workItem)
-    private let intake = OSAllocatedUnfairLock(initialState: Intake())
-    private var state: EncoderState = .active
+    private let intake = OSAllocatedUnfairLock(initialState: Intake.accepting(backlog: 0))
+    private var state: EncoderState = .waitingForFirstFrame
 
-    init(outputURL: URL, framerate: Int) {
+    init(outputURL: URL) throws {
         self.outputURL = outputURL
-        self.stream = GIFFrameStream(url: outputURL, framerate: framerate)
+        self.stream = QueueConfined(try GIFFrameStream(url: outputURL))
     }
 
     /// Throws the error of an earlier frame that failed to encode, so the recording
     /// stops instead of capturing into a broken file.
     func append(_ frame: CapturedFrame) throws {
-        guard case .active = state else { return }
+        switch state {
+        case .closed: return
+        case .waitingForFirstFrame: state = .recording(startHostTime: frame.hostTime - frame.timestamp)
+        case .recording: break
+        }
         switch try intake.withLock({ try $0.admit() }) {
         case .dropped: return
         case .queued: break
         }
         encodeQueue.async { [stream, intake] in
-            do {
-                try stream.add(frame.image, at: frame.timestamp)
-                intake.withLock { $0.backlog -= 1 }
-            } catch {
-                intake.withLock { $0.failure = $0.failure ?? error }
-            }
+            let outcome = Result { try stream.value.add(frame.image, at: frame.timestamp) }
+            intake.withLock { $0.settle(outcome) }
         }
     }
 
+    /// The GIF lasts until now. ScreenCaptureKit only delivers frames when the screen
+    /// changes, so the last frame received stays on screen up to the moment of stopping.
     func finish() async throws -> URL {
-        guard case .active = state else {
-            throw NSError(domain: "Screensnap", code: 2, userInfo: [NSLocalizedDescriptionKey: "GIF destination already finalized"])
+        let end: CFTimeInterval
+        switch state {
+        case .closed: throw GIFStreamError.closed
+        case .waitingForFirstFrame: end = 0
+        case .recording(let startHostTime): end = CACurrentMediaTime() - startHostTime
         }
-        state = .finished
+        state = .closed
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            encodeQueue.async { [stream, intake] in
-                if let failure = intake.withLock({ $0.failure }) {
-                    stream.abandon()
-                    continuation.resume(throwing: failure)
-                } else {
-                    continuation.resume(with: Result { try stream.finish() })
-                }
+            encodeQueue.async { [stream] in
+                continuation.resume(with: Result { try stream.value.finish(at: end) })
             }
         }
         return outputURL
     }
 
     func cancel() {
-        state = .cancelled
-        encodeQueue.async { [stream] in stream.abandon() }
+        state = .closed
+        encodeQueue.async { [stream] in stream.value.abandon() }
+    }
+}
+
+/// A value only ever used on one serial queue. `@unchecked Sendable` because that
+/// confinement is what makes handing it to the queue safe, and the compiler cannot see it.
+private final class QueueConfined<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
     }
 }
 
@@ -138,7 +160,7 @@ final class GifskiEncoder: FrameEncoder {
     private let quality: Int
     private let gifskiURL: URL
     private let tempDir: URL
-    private var frameTimestamps: [CFTimeInterval] = []
+    private var frames: [SavedFrame] = []
     private let encodeQueue = DispatchQueue(label: "Screensnap.gifskiEncode", qos: .userInitiated)
     private var isCancelled = false
 
@@ -162,16 +184,15 @@ final class GifskiEncoder: FrameEncoder {
         let timestamp: CFTimeInterval
     }
 
-    private func frameFile(_ index: Int) -> URL {
-        tempDir.appendingPathComponent(String(format: "frame-%06d.png", index))
-    }
-
     func append(_ frame: CapturedFrame) throws {
         guard !isCancelled else { return }
-        let index = frameTimestamps.count
-        frameTimestamps.append(frame.timestamp)
+        let saved = SavedFrame(
+            file: tempDir.appendingPathComponent(String(format: "frame-%06d.png", frames.count)),
+            timestamp: frame.timestamp
+        )
+        frames.append(saved)
         let image = frame.image
-        let destURL = frameFile(index)
+        let destURL = saved.file
         encodeQueue.async {
             guard let dest = CGImageDestinationCreateWithURL(destURL as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
             CGImageDestinationAddImage(dest, image, nil)
@@ -186,18 +207,18 @@ final class GifskiEncoder: FrameEncoder {
         defer { try? FileManager.default.removeItem(at: tempDir) }
         guard !isCancelled else { throw CancellationError() }
 
-        // A frame whose PNG failed to write is skipped; its neighbours keep their own timestamps.
-        let frames = frameTimestamps.enumerated()
-            .map { SavedFrame(file: frameFile($0.offset), timestamp: $0.element) }
-            .filter { FileManager.default.fileExists(atPath: $0.file.path) }
+        // A frame whose PNG failed to write is skipped. gifski spaces the rest evenly
+        // by --fps; the fallback keeps each frame's own timestamp.
+        let written = frames.filter { FileManager.default.fileExists(atPath: $0.file.path) }
 
         do {
-            try await runGifski(frames: frames.map(\.file))
+            try await runGifski(frames: written.map(\.file))
         } catch {
             FileHandle.standardError.write(Data("[Screensnap] gifski failed, assembling with ImageIO: \(error.localizedDescription)\n".utf8))
-            let framerate = self.framerate, outputURL = self.outputURL
+            let end = (written.last?.timestamp ?? 0) + 1.0 / Double(max(1, framerate))
+            let outputURL = self.outputURL
             try await Task.detached(priority: .userInitiated) {
-                try Self.assembleWithImageIO(frames, framerate: framerate, outputURL: outputURL)
+                try Self.assembleWithImageIO(written, end: end, outputURL: outputURL)
             }.value
         }
         return outputURL
@@ -226,23 +247,19 @@ final class GifskiEncoder: FrameEncoder {
         }
     }
 
-    private nonisolated static func assembleWithImageIO(_ frames: [SavedFrame], framerate: Int, outputURL: URL) throws {
+    private nonisolated static func assembleWithImageIO(_ frames: [SavedFrame], end: CFTimeInterval, outputURL: URL) throws {
+        // gifski may have left a partial file, and the stream replaces it only on success.
         try? FileManager.default.removeItem(at: outputURL)
-        let stream = GIFFrameStream(url: outputURL, framerate: framerate)
+        let stream = try GIFFrameStream(url: outputURL)
         let decodeOnDemand = [kCGImageSourceShouldCache: false] as CFDictionary
-        do {
-            for frame in frames {
-                try autoreleasepool {
-                    guard let source = CGImageSourceCreateWithURL(frame.file as CFURL, nil),
-                          let image = CGImageSourceCreateImageAtIndex(source, 0, decodeOnDemand) else { return }
-                    try stream.add(image, at: frame.timestamp)
-                }
+        for frame in frames {
+            try autoreleasepool {
+                guard let source = CGImageSourceCreateWithURL(frame.file as CFURL, nil),
+                      let image = CGImageSourceCreateImageAtIndex(source, 0, decodeOnDemand) else { return }
+                try stream.add(image, at: frame.timestamp)
             }
-            try stream.finish()
-        } catch {
-            stream.abandon()
-            throw error
         }
+        try stream.finish(at: end)
     }
 
     func cancel() {

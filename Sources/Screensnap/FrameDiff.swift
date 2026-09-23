@@ -1,3 +1,4 @@
+import Accelerate
 import CoreGraphics
 import Foundation
 
@@ -19,31 +20,81 @@ struct PixelRect: Equatable {
     }
 }
 
+extension CGImage {
+    var pixelBounds: PixelRect {
+        PixelRect(origin: .zero, size: Dimensions(width: width, height: height))
+    }
+}
+
 /// What differs between a frame and the one before it.
 enum FrameChange: Equatable {
     case unchanged
     case region(PixelRect)
 }
 
+/// Whether a region holds any pixel short of fully opaque. GIF transparency is on or
+/// off per pixel, so such a pixel may come out transparent.
+enum Opacity: Equatable {
+    case opaque
+    case translucent
+}
+
+/// Where a pixel's alpha lives.
+private enum AlphaChannel: Equatable {
+    case absent
+    /// Offset of the alpha byte inside an 8-bit, four-channel pixel.
+    case byte(offset: Int)
+    /// A layout this code does not read. Treated as possibly translucent.
+    case unreadable
+
+    init(_ image: CGImage) {
+        let alphaFirst: Bool
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast:
+            self = .absent
+            return
+        case .premultipliedFirst, .first:
+            alphaFirst = true
+        case .premultipliedLast, .last:
+            alphaFirst = false
+        case .alphaOnly:
+            self = .unreadable
+            return
+        @unknown default:
+            self = .unreadable
+            return
+        }
+        guard image.bitsPerPixel == 32, image.bitsPerComponent == 8 else {
+            self = .unreadable
+            return
+        }
+        switch image.byteOrderInfo {
+        case .orderDefault, .order32Big: self = .byte(offset: alphaFirst ? 0 : 3)
+        case .order32Little: self = .byte(offset: alphaFirst ? 3 : 0)
+        default: self = .unreadable
+        }
+    }
+}
+
 /// Everything that decides where a pixel's bytes live. Two frames can only be
 /// compared byte for byte when these match.
 private struct PixelLayout: Equatable {
-    let width: Int
-    let height: Int
+    let size: Dimensions
     let bitsPerPixel: Int
     let bytesPerRow: Int
     let bitmapInfo: UInt32
+    let alpha: AlphaChannel
 
     init(_ image: CGImage) {
-        width = image.width
-        height = image.height
+        size = image.pixelBounds.size
         bitsPerPixel = image.bitsPerPixel
         bytesPerRow = image.bytesPerRow
         bitmapInfo = image.bitmapInfo.rawValue
+        alpha = AlphaChannel(image)
     }
 
     var bytesPerPixel: Int { bitsPerPixel / 8 }
-    var bounds: PixelRect { PixelRect(origin: .zero, size: Dimensions(width: width, height: height)) }
+    var bounds: PixelRect { PixelRect(origin: .zero, size: size) }
 }
 
 /// A frame's raw pixel bytes, kept so the next frame can be compared against it.
@@ -57,32 +108,31 @@ struct FramePixels {
     init?(_ image: CGImage) {
         let layout = PixelLayout(image)
         guard layout.bitsPerPixel % 8 == 0, let bytes = image.dataProvider?.data else { return nil }
-        let lastRowEnd = layout.bytesPerRow * (layout.height - 1) + layout.width * layout.bytesPerPixel
+        let lastRowEnd = layout.bytesPerRow * (layout.size.height - 1) + layout.size.width * layout.bytesPerPixel
         guard CFDataGetLength(bytes) >= lastRowEnd else { return nil }
         self.layout = layout
         self.bytes = bytes
     }
-
-    var bounds: PixelRect { layout.bounds }
 
     /// The smallest rectangle holding every pixel that differs from `previous`.
     /// Frames laid out differently cannot be compared, so all of this one counts as changed.
     func change(since previous: FramePixels) -> FrameChange {
         guard layout == previous.layout,
               let old = CFDataGetBytePtr(previous.bytes),
-              let new = CFDataGetBytePtr(bytes) else { return .region(bounds) }
-        let width = layout.width
+              let new = CFDataGetBytePtr(bytes) else { return .region(layout.bounds) }
+        let width = layout.size.width
         let fullRow = 0..<width
         func row(_ y: Int) -> RowComparison {
             RowComparison(old: old + y * layout.bytesPerRow, new: new + y * layout.bytesPerRow, bytesPerPixel: layout.bytesPerPixel)
         }
 
-        let rows = 0..<layout.height
+        let rows = 0..<layout.size.height
         guard let top = rows.first(where: { row($0).differs(fullRow) }),
               let bottom = rows.last(where: { row($0).differs(fullRow) }) else { return .unchanged }
 
-        var left = row(top).firstDifference(in: fullRow)
-        var right = row(top).lastDifference(in: fullRow)
+        // Start with an empty column range; the first differing row widens it.
+        var left = width
+        var right = -1
         for y in top...bottom {
             let pair = row(y)
             if pair.differs(0..<left) {
@@ -96,6 +146,34 @@ struct FramePixels {
             origin: PixelPoint(x: left, y: top),
             size: Dimensions(width: right - left + 1, height: bottom - top + 1)
         ))
+    }
+
+    /// Whether every pixel inside `rect` is fully opaque. `rect` must lie within the frame.
+    func opacity(in rect: PixelRect) -> Opacity {
+        switch layout.alpha {
+        case .absent:
+            return .opaque
+        case .unreadable:
+            return .translucent
+        case .byte(let offset):
+            guard let base = CFDataGetBytePtr(bytes) else { return .translucent }
+            let start = base + rect.origin.y * layout.bytesPerRow + rect.origin.x * layout.bytesPerPixel
+            var region = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: start),
+                height: vImagePixelCount(rect.size.height),
+                width: vImagePixelCount(rect.size.width),
+                rowBytes: layout.bytesPerRow
+            )
+            // One 256-bin histogram per byte of the pixel, in memory order.
+            let counts = UnsafeMutablePointer<vImagePixelCount>.allocate(capacity: 4 * 256)
+            defer { counts.deallocate() }
+            var channels: [UnsafeMutablePointer<vImagePixelCount>?] = (0..<4).map { counts + $0 * 256 }
+            guard vImageHistogramCalculation_ARGB8888(&region, &channels, vImage_Flags(kvImageNoFlags)) == kvImageNoError else {
+                return .translucent
+            }
+            let fullyOpaque = counts[offset * 256 + 255]
+            return fullyOpaque == vImagePixelCount(rect.size.width * rect.size.height) ? .opaque : .translucent
+        }
     }
 }
 
