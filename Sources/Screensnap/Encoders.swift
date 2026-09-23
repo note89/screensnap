@@ -25,7 +25,7 @@ struct EncoderSetup {
     static func make(output: Output, url: URL, framerate: Int, pixelSize: CGSize, audio: AudioTrack) throws -> EncoderSetup {
         switch output {
         case .gif(.fast):
-            return EncoderSetup(encoder: try ImageIOGifEncoder(outputURL: url, framerate: framerate), audioChannel: nil)
+            return EncoderSetup(encoder: try ImageIOGifEncoder(outputURL: url), audioChannel: nil)
         case .gif(.best):
             return EncoderSetup(encoder: try GifskiEncoder(outputURL: url, framerate: framerate, quality: GifskiEncoder.defaultQuality), audioChannel: nil)
         case .mp4:
@@ -35,78 +35,122 @@ struct EncoderSetup {
     }
 }
 
-enum GIFFrameProperties {
-    static let loopForever = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary
-
-    static func delay(_ seconds: CFTimeInterval) -> CFDictionary {
-        [kCGImagePropertyGIFDictionary: [
-            kCGImagePropertyGIFDelayTime: seconds,
-            kCGImagePropertyGIFUnclampedDelayTime: seconds,
-        ]] as CFDictionary
-    }
-}
-
 // MARK: - ImageIO GIF
 
+/// Streams frames into a `GIFFrameStream` on a background queue. When encoding falls
+/// behind capture, new frames are dropped rather than queued, so memory stays bounded;
+/// the frame before a gap simply stays up longer.
 @MainActor
 final class ImageIOGifEncoder: FrameEncoder {
-    private let outputURL: URL
-    private let framerate: Int
+    private enum Admission {
+        case queued
+        case dropped
+    }
+
+    /// How many frames wait on the encode queue, or the error that ended encoding.
+    private enum Intake {
+        /// A full-screen Retina frame is ~24 MB and takes ~70 ms to quantize, so a short
+        /// queue only absorbs jitter.
+        static let maxBacklog = 3
+
+        case accepting(backlog: Int)
+        case failed(Error)
+
+        mutating func admit() throws -> Admission {
+            switch self {
+            case .failed(let error):
+                throw error
+            case .accepting(let backlog):
+                guard backlog < Self.maxBacklog else { return .dropped }
+                self = .accepting(backlog: backlog + 1)
+                return .queued
+            }
+        }
+
+        mutating func settle(_ outcome: Result<Void, Error>) {
+            guard case .accepting(let backlog) = self else { return }
+            switch outcome {
+            case .success: self = .accepting(backlog: backlog - 1)
+            case .failure(let error): self = .failed(error)
+            }
+        }
+    }
+
     private enum EncoderState {
-        case active(CGImageDestination)
-        case finished
-        case cancelled
+        case waitingForFirstFrame
+        /// `startHostTime` is the host-clock moment the recording's timeline starts.
+        case recording(startHostTime: CFTimeInterval)
+        case closed
     }
-    private var state: EncoderState
-    private var lastFrameTime: CFTimeInterval = 0
-    private var frameCount = 0
 
-    init(outputURL: URL, framerate: Int) throws {
+    private let outputURL: URL
+    private let stream: QueueConfined<GIFFrameStream>
+    private let encodeQueue = DispatchQueue(label: "Screensnap.gifEncode", qos: .userInitiated, autoreleaseFrequency: .workItem)
+    private let intake = OSAllocatedUnfairLock(initialState: Intake.accepting(backlog: 0))
+    private var state: EncoderState = .waitingForFirstFrame
+
+    init(outputURL: URL) throws {
         self.outputURL = outputURL
-        self.framerate = framerate
-        guard let dest = CGImageDestinationCreateWithURL(
-            outputURL as CFURL,
-            UTType.gif.identifier as CFString,
-            0, // we'll set the count by appending
-            nil
-        ) else {
-            throw NSError(domain: "Screensnap", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not open GIF destination"])
-        }
-        CGImageDestinationSetProperties(dest, GIFFrameProperties.loopForever)
-        self.state = .active(dest)
+        self.stream = QueueConfined(try GIFFrameStream(url: outputURL))
     }
 
+    /// Throws the error of an earlier frame that failed to encode, so the recording
+    /// stops instead of capturing into a broken file.
     func append(_ frame: CapturedFrame) throws {
-        guard case .active(let destination) = state else { return }
-
-        let delay = frameCount == 0 ? 1.0 / Double(framerate) : max(0.02, frame.timestamp - lastFrameTime)
-        lastFrameTime = frame.timestamp
-        frameCount += 1
-        CGImageDestinationAddImage(destination, frame.image, GIFFrameProperties.delay(delay))
+        switch state {
+        case .closed: return
+        case .waitingForFirstFrame: state = .recording(startHostTime: frame.hostTime - frame.timestamp)
+        case .recording: break
+        }
+        switch try intake.withLock({ try $0.admit() }) {
+        case .dropped: return
+        case .queued: break
+        }
+        encodeQueue.async { [stream, intake] in
+            let outcome = Result { try stream.value.add(frame.image, at: frame.timestamp) }
+            intake.withLock { $0.settle(outcome) }
+        }
     }
 
+    /// The GIF lasts until now. ScreenCaptureKit only delivers frames when the screen
+    /// changes, so the last frame received stays on screen up to the moment of stopping.
     func finish() async throws -> URL {
-        guard case .active(let destination) = state else {
-            throw NSError(domain: "Screensnap", code: 2, userInfo: [NSLocalizedDescriptionKey: "GIF destination already finalized"])
+        let end: CFTimeInterval
+        switch state {
+        case .closed: throw GIFStreamError.closed
+        case .waitingForFirstFrame: end = 0
+        case .recording(let startHostTime): end = CACurrentMediaTime() - startHostTime
         }
-        state = .finished
-        if !CGImageDestinationFinalize(destination) {
-            throw NSError(domain: "Screensnap", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to write GIF"])
+        state = .closed
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            encodeQueue.async { [stream] in
+                continuation.resume(with: Result { try stream.value.finish(at: end) })
+            }
         }
         return outputURL
     }
 
     func cancel() {
-        state = .cancelled
-        try? FileManager.default.removeItem(at: outputURL)
+        state = .closed
+        encodeQueue.async { [stream] in stream.value.abandon() }
+    }
+}
+
+/// A value only ever used on one serial queue. `@unchecked Sendable` because that
+/// confinement is what makes handing it to the queue safe, and the compiler cannot see it.
+private final class QueueConfined<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
     }
 }
 
 // MARK: - gifski (high-quality)
 
 /// Streams frames as PNGs into a temp directory, then runs `gifski` over them on
-/// `finish()`. If gifski fails the same PNGs are assembled with ImageIO instead —
-/// a captured recording is never lost to an encoder problem.
+/// `finish()`. If gifski fails the same PNGs are streamed through `GIFFrameStream`
+/// instead — a captured recording is never lost to an encoder problem.
 @MainActor
 final class GifskiEncoder: FrameEncoder {
     static let defaultQuality = 80
@@ -116,7 +160,7 @@ final class GifskiEncoder: FrameEncoder {
     private let quality: Int
     private let gifskiURL: URL
     private let tempDir: URL
-    private var frameTimestamps: [CFTimeInterval] = []
+    private var frames: [SavedFrame] = []
     private let encodeQueue = DispatchQueue(label: "Screensnap.gifskiEncode", qos: .userInitiated)
     private var isCancelled = false
 
@@ -135,12 +179,20 @@ final class GifskiEncoder: FrameEncoder {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     }
 
+    private struct SavedFrame {
+        let file: URL
+        let timestamp: CFTimeInterval
+    }
+
     func append(_ frame: CapturedFrame) throws {
         guard !isCancelled else { return }
-        let index = frameTimestamps.count
-        frameTimestamps.append(frame.timestamp)
+        let saved = SavedFrame(
+            file: tempDir.appendingPathComponent(String(format: "frame-%06d.png", frames.count)),
+            timestamp: frame.timestamp
+        )
+        frames.append(saved)
         let image = frame.image
-        let destURL = tempDir.appendingPathComponent(String(format: "frame-%06d.png", index))
+        let destURL = saved.file
         encodeQueue.async {
             guard let dest = CGImageDestinationCreateWithURL(destURL as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
             CGImageDestinationAddImage(dest, image, nil)
@@ -155,16 +207,19 @@ final class GifskiEncoder: FrameEncoder {
         defer { try? FileManager.default.removeItem(at: tempDir) }
         guard !isCancelled else { throw CancellationError() }
 
-        let frameFiles = (try FileManager.default.contentsOfDirectory(atPath: tempDir.path))
-            .filter { $0.hasPrefix("frame-") && $0.hasSuffix(".png") }
-            .sorted()
-            .map { tempDir.appendingPathComponent($0) }
+        // A frame whose PNG failed to write is skipped. gifski spaces the rest evenly
+        // by --fps; the fallback keeps each frame's own timestamp.
+        let written = frames.filter { FileManager.default.fileExists(atPath: $0.file.path) }
 
         do {
-            try await runGifski(frames: frameFiles)
+            try await runGifski(frames: written.map(\.file))
         } catch {
             FileHandle.standardError.write(Data("[Screensnap] gifski failed, assembling with ImageIO: \(error.localizedDescription)\n".utf8))
-            try Self.assembleWithImageIO(frames: frameFiles, timestamps: frameTimestamps, framerate: framerate, outputURL: outputURL)
+            let end = (written.last?.timestamp ?? 0) + 1.0 / Double(max(1, framerate))
+            let outputURL = self.outputURL
+            try await Task.detached(priority: .userInitiated) {
+                try Self.assembleWithImageIO(written, end: end, outputURL: outputURL)
+            }.value
         }
         return outputURL
     }
@@ -192,23 +247,19 @@ final class GifskiEncoder: FrameEncoder {
         }
     }
 
-    private static func assembleWithImageIO(frames: [URL], timestamps: [CFTimeInterval], framerate: Int, outputURL: URL) throws {
+    private nonisolated static func assembleWithImageIO(_ frames: [SavedFrame], end: CFTimeInterval, outputURL: URL) throws {
+        // gifski may have left a partial file, and the stream replaces it only on success.
         try? FileManager.default.removeItem(at: outputURL)
-        guard let destination = CGImageDestinationCreateWithURL(outputURL as CFURL, UTType.gif.identifier as CFString, 0, nil) else {
-            throw NSError(domain: "Screensnap", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not open GIF destination"])
+        let stream = try GIFFrameStream(url: outputURL)
+        let decodeOnDemand = [kCGImageSourceShouldCache: false] as CFDictionary
+        for frame in frames {
+            try autoreleasepool {
+                guard let source = CGImageSourceCreateWithURL(frame.file as CFURL, nil),
+                      let image = CGImageSourceCreateImageAtIndex(source, 0, decodeOnDemand) else { return }
+                try stream.add(image, at: frame.timestamp)
+            }
         }
-        CGImageDestinationSetProperties(destination, GIFFrameProperties.loopForever)
-        for (index, file) in frames.enumerated() {
-            guard let source = CGImageSourceCreateWithURL(file as CFURL, nil),
-                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { continue }
-            let delay = index == 0 || index >= timestamps.count
-                ? 1.0 / Double(framerate)
-                : max(0.02, timestamps[index] - timestamps[index - 1])
-            CGImageDestinationAddImage(destination, image, GIFFrameProperties.delay(delay))
-        }
-        guard CGImageDestinationFinalize(destination) else {
-            throw NSError(domain: "Screensnap", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to write GIF"])
-        }
+        try stream.finish(at: end)
     }
 
     func cancel() {
