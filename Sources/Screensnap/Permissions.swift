@@ -4,8 +4,25 @@ import CoreGraphics
 
 struct PermissionReport: Equatable {
     var screenRecording: Bool
-    var camera: Bool
-    var microphone: Bool
+    var camera: DeviceAccess
+    var microphone: DeviceAccess
+}
+
+/// Camera and microphone lists in System Settings only contain apps that have asked
+/// at least once, and they accept no drops — so `notAsked` must be answered with the
+/// system prompt, and only `denied` with a trip to System Settings.
+enum DeviceAccess: Equatable {
+    case granted
+    case notAsked
+    case denied
+
+    init(_ status: AVAuthorizationStatus) {
+        switch status {
+        case .authorized: self = .granted
+        case .notDetermined: self = .notAsked
+        default: self = .denied
+        }
+    }
 }
 
 enum PermissionPane {
@@ -46,8 +63,8 @@ enum Permissions {
     static func check() -> PermissionReport {
         PermissionReport(
             screenRecording: CGPreflightScreenCaptureAccess(),
-            camera: AVCaptureDevice.authorizationStatus(for: .video) == .authorized,
-            microphone: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            camera: DeviceAccess(AVCaptureDevice.authorizationStatus(for: .video)),
+            microphone: DeviceAccess(AVCaptureDevice.authorizationStatus(for: .audio))
         )
     }
 
@@ -81,12 +98,13 @@ enum Permissions {
 }
 
 enum Relaunch {
-    static func now() {
+    /// The default delay lets the menu or HUD that triggered the relaunch finish closing.
+    static func now(after delay: Duration = .milliseconds(400)) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         process.arguments = ["-n", Bundle.main.bundleURL.path]
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
+            try? await Task.sleep(for: delay)
             try? process.run()
             NSApp.terminate(nil)
         }

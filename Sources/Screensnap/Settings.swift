@@ -99,6 +99,7 @@ final class Settings {
             Key.captureCursor: true,
             Key.copyToClipboard: true,
             Key.revealInFinder: false,
+            Key.sizeLimitBytes: 100_000_000,
             Key.filenameFormat: Self.defaultFilenameFormat,
         ])
         framerate = defaults.integer(forKey: Key.framerate).clamped(to: Self.framerateRange)

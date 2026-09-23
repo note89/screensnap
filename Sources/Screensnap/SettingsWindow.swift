@@ -183,8 +183,8 @@ struct PermissionsRows: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             screenRecordingRow
-            optionalRow("Camera", granted: coordinator.permissions.camera, pane: .camera)
-            optionalRow("Microphone", granted: coordinator.permissions.microphone, pane: .microphone)
+            DeviceAccessRow(name: "Camera", access: coordinator.permissions.camera, pane: .camera, request: coordinator.requestCamera)
+            DeviceAccessRow(name: "Microphone", access: coordinator.permissions.microphone, pane: .microphone, request: coordinator.requestMicrophone)
         }
         .onAppear { coordinator.refreshPermissions() }
     }
@@ -210,21 +210,39 @@ struct PermissionsRows: View {
                 Text("Screen Recording")
                 Text("required").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Open Settings") { Permissions.openSettings(.screenRecording) }
+                Button("Grant Access…") { coordinator.grantScreenRecording() }
             }
-            Text("Turn Screensnap on in System Settings and come back. The app relaunches itself the first time you record afterwards.")
+            Text("Drag Screensnap into the list in System Settings and turn it on. The app relaunches itself the first time you record afterwards.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
 
-    private func optionalRow(_ name: String, granted: Bool, pane: PermissionPane) -> some View {
+}
+
+/// Camera/microphone: ask first (that's what adds Screensnap to the System Settings
+/// list), and only send the user to System Settings once they've said no.
+private struct DeviceAccessRow: View {
+    let name: String
+    let access: DeviceAccess
+    let pane: PermissionPane
+    let request: () -> Void
+    var caption: String? = "only when used"
+
+    var body: some View {
         HStack {
-            Image(systemName: granted ? "checkmark.circle.fill" : "minus.circle")
-                .foregroundStyle(granted ? Color.green : Color.secondary)
+            switch access {
+            case .granted: Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.green)
+            case .notAsked: Image(systemName: "minus.circle").foregroundStyle(Color.secondary)
+            case .denied: Image(systemName: "xmark.circle.fill").foregroundStyle(Color.orange)
+            }
             Text(name)
-            Text("only when used").font(.caption).foregroundStyle(.secondary)
+            if let caption { Text(caption).font(.caption).foregroundStyle(.secondary) }
             Spacer()
-            if !granted { Button("Open Settings") { Permissions.openSettings(pane) } }
+            switch access {
+            case .granted: EmptyView()
+            case .notAsked: Button("Allow…", action: request)
+            case .denied: Button("Open Settings") { Permissions.openSettings(pane) }
+            }
         }
     }
 }
@@ -411,14 +429,8 @@ private struct FacecamPane: View {
             Divider().padding(.vertical, 4)
 
             SectionLabel("PERMISSION")
-            HStack {
-                Image(systemName: coordinator.permissions.camera ? "checkmark.circle.fill" : "minus.circle")
-                    .foregroundStyle(coordinator.permissions.camera ? Color.green : Color.secondary)
-                Text("Camera")
-                Spacer()
-                if !coordinator.permissions.camera { Button("Open Settings") { Permissions.openSettings(.camera) } }
-            }
-            .onAppear { coordinator.refreshPermissions() }
+            DeviceAccessRow(name: "Camera", access: coordinator.permissions.camera, pane: .camera, request: coordinator.requestCamera, caption: nil)
+                .onAppear { coordinator.refreshPermissions() }
         }
     }
 }

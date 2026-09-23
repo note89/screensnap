@@ -47,6 +47,7 @@ final class Coordinator: FrameSink {
     let updater: Updater
 
     @ObservationIgnored private let hud = HUDPanel()
+    @ObservationIgnored private let grantPanel = GrantPanel()
     @ObservationIgnored private let permissionsAtLaunch: PermissionReport
     @ObservationIgnored private var session: RecordingSession?
     @ObservationIgnored private var hotkey: GlobalHotkey?
@@ -79,6 +80,25 @@ final class Coordinator: FrameSink {
 
     var screenRecordingAccess: ScreenRecordingAccess {
         permissions.screenRecordingAccess(since: permissionsAtLaunch)
+    }
+
+    /// Opens the pane with the drag tile beside it. No `requestScreenRecording()`
+    /// here: its dialog would stack on top of the pane we're already opening.
+    /// The grant only reaches a fresh process, so relaunch the moment it lands —
+    /// ideally before System Settings gets to ask "Quit & Reopen?".
+    func grantScreenRecording() {
+        Permissions.openSettings(.screenRecording)
+        grantPanel.show(isGranted: { CGPreflightScreenCaptureAccess() }) {
+            Relaunch.now(after: .zero)
+        }
+    }
+
+    func requestCamera() {
+        Task { _ = await Permissions.ensureCameraAccess(); refreshPermissions() }
+    }
+
+    func requestMicrophone() {
+        Task { _ = await Permissions.ensureMicrophoneAccess(); refreshPermissions() }
     }
 
     // MARK: Recording flow

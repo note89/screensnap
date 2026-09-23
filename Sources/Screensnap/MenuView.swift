@@ -27,6 +27,9 @@ struct MenuView: View {
             }
         }
         Divider()
+        RecordingOptions(settings: coordinator.settings)
+            .disabled(coordinator.phase.isBusy)
+        Divider()
         if let last = coordinator.lastRecording {
             Button("Copy last recording · \(last.bytes.formatted)") { coordinator.copyLast() }
         }
@@ -74,5 +77,28 @@ struct MenuView: View {
         case .settled(.discarded): return "discarded"
         case .settled(.failed(let message)): return message
         }
+    }
+}
+
+/// The two choices people flip between recordings: file type and size cap. Everything
+/// finer (GIF quality, microphone, custom sizes) stays in the settings window.
+private struct RecordingOptions: View {
+    @Bindable var settings: Settings
+
+    var body: some View {
+        Picker("Format", selection: $settings.outputContainer) {
+            Text("GIF").tag(OutputContainer.gif)
+            Text("MP4").tag(OutputContainer.mp4)
+        }
+        .pickerStyle(.inline)
+        Picker(selection: $settings.sizeLimit) {
+            ForEach(SizeLimit.presets, id: \.limit) { Text($0.label).tag($0.limit) }
+            if !SizeLimit.presets.contains(where: { $0.limit == settings.sizeLimit }) {
+                Text(settings.sizeLimit.label).tag(settings.sizeLimit)
+            }
+        } label: {
+            Text("Size limit · \(settings.sizeLimit.label)")
+        }
+        .pickerStyle(.menu)
     }
 }
