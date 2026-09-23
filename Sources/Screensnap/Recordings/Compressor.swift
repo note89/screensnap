@@ -1,7 +1,6 @@
 @preconcurrency import AVFoundation
 import Foundation
 import ImageIO
-import UniformTypeIdentifiers
 
 /// Boxes a recording is scaled to fit inside; the number is the short edge of a
 /// landscape recording, the way people say "720p".
@@ -116,7 +115,7 @@ enum Compressor {
         }
 
         let destination = try place(scratch, for: recording, target: target, placement: placement)
-        let bytes = ByteCount(Int64((try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0))
+        let bytes = fileSize(destination)
         return CompressionResult(url: destination, bytes: bytes, fit: fit)
     }
 
@@ -135,6 +134,14 @@ enum Compressor {
         }
         try FileManager.default.moveItem(at: scratch, to: destination)
         return destination
+    }
+
+    /// Asks the file system every time. `URL.resourceValues` caches on the URL, and off
+    /// the main run loop that cache is never cleared, so reading `scratch` after a later
+    /// attempt rewrote it would return the first attempt's size.
+    private static func fileSize(_ url: URL) -> ByteCount {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return ByteCount((attributes?[.size] as? NSNumber)?.int64Value ?? 0)
     }
 
     private static func uniqueURL(folder: URL, stem: String, pathExtension: String) -> URL {
@@ -177,7 +184,7 @@ enum Compressor {
             try await export(asset, preset: preset.exportPreset, to: scratch, fileLengthLimit: cap) { fraction in
                 progress((Double(step) + fraction) / Double(ladder.count))
             }
-            let bytes = Int64((try? scratch.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            let bytes = fileSize(scratch).bytes
             if let limit, bytes > limit, step < ladder.count - 1 { continue }
             return limit.map { bytes <= $0 ? .met : .exceeded } ?? .met
         }
@@ -212,9 +219,16 @@ enum Compressor {
     // MARK: GIF
 
     private struct GIFAttempt {
+        /// Below 1 shrinks every frame; 1 or more keeps the original size.
         let scale: Double
-        /// Keep every n-th frame; skipped frames donate their delay to the kept one.
+        /// Keep every n-th frame; the kept one stays up through the skipped ones after it.
         let stride: Int
+
+        /// nil when the frame cannot be scaled; never the original size in place of a
+        /// smaller one, because every frame must match the canvas the first one set.
+        func resized(_ frame: CGImage) -> CGImage? {
+            scale < 1 ? frame.scaled(by: scale) : frame
+        }
     }
 
     private static func compressGIF(_ url: URL, info: MediaInfo, to target: CompressionTarget, into scratch: URL, progress: @escaping ProgressHandler) async throws -> SizeFit {
@@ -244,39 +258,42 @@ enum Compressor {
                     progress((Double(step) + fraction) / total)
                 }
             }.value
-            let bytes = Int64((try? scratch.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            let bytes = fileSize(scratch).bytes
             if let limit, bytes > limit, step < attempts.count - 1 { continue }
             return limit.map { bytes <= $0 ? .met : .exceeded } ?? .met
         }
         throw CompressionError.unreadable
     }
 
+    /// Streams the frames through `GIFFrameStream`, which holds about one frame at a time.
+    /// A single `CGImageDestination` would keep every frame until finalize and then need
+    /// ~60 MB per Retina frame to build one palette.
     private static func reencodeGIF(_ url: URL, attempt: GIFAttempt, to scratch: URL, progress: ProgressHandler) throws {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { throw CompressionError.unreadable }
         let count = CGImageSourceGetCount(source)
-        guard count > 0, let destination = CGImageDestinationCreateWithURL(scratch as CFURL, UTType.gif.identifier as CFString, 0, nil) else {
+        guard count > 0 else { throw CompressionError.unreadable }
+
+        let stream = try GIFFrameStream(url: scratch)
+        // Each kept frame starts when it did in the source. A frame that is skipped or
+        // cannot be read still advances `elapsed`, so the kept frame before it stays up
+        // through it, and the last one stays up until the source ends.
+        var elapsed: CFTimeInterval = 0
+        for index in 0..<count {
+            if index % 10 == 0 { progress(Double(index) / Double(count)) }
+            let start = elapsed
+            elapsed += GIFFrame.delay(source, index: index)
+            guard index % attempt.stride == 0 else { continue }
+            try autoreleasepool {
+                guard let frame = GIFFrame.decodedImage(source, index: index) else { return }
+                guard let resized = attempt.resized(frame) else { throw CompressionError.exportFailed("could not scale a frame") }
+                try stream.add(resized, at: start)
+            }
+        }
+        do {
+            try stream.finish(at: elapsed)
+        } catch GIFStreamError.noFrames {
             throw CompressionError.unreadable
         }
-        CGImageDestinationSetProperties(destination, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
-
-        var carriedDelay: TimeInterval = 0
-        for index in 0..<count {
-            let delay = GIFFrame.delay(source, index: index)
-            carriedDelay += delay
-            guard index % attempt.stride == 0 else { continue }
-            guard let frame = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
-            let scaled = attempt.scale < 1 ? (frame.scaled(by: attempt.scale) ?? frame) : frame
-            let props: [CFString: Any] = [
-                kCGImagePropertyGIFDictionary: [
-                    kCGImagePropertyGIFDelayTime: carriedDelay,
-                    kCGImagePropertyGIFUnclampedDelayTime: carriedDelay,
-                ]
-            ]
-            CGImageDestinationAddImage(destination, scaled, props as CFDictionary)
-            carriedDelay = 0
-            if index % 10 == 0 { progress(Double(index) / Double(count)) }
-        }
-        guard CGImageDestinationFinalize(destination) else { throw CompressionError.exportFailed("could not write GIF") }
     }
 }
 
