@@ -30,7 +30,7 @@ enum FinishStep: Equatable {
     var label: String {
         switch self {
         case .encoding(let output): return "Encoding \(output.label)…"
-        case .fittingToLimit(let limit, _): return "Fitting under \(limit.formatted)…"
+        case .fittingToLimit(let limit, _): return "Shrinking to fit \(limit.formatted)…"
         }
     }
 }

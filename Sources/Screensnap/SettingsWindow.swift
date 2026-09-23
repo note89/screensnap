@@ -300,7 +300,7 @@ private struct OutputPane: View {
 
             Divider().padding(.vertical, 4)
 
-            SectionLabel("SIZE LIMIT")
+            SectionLabel("SHRINK TO FIT")
             Picker("", selection: Binding(
                 get: { SizeLimitChoice(settings.sizeLimit) },
                 set: { choice in
@@ -326,7 +326,7 @@ private struct OutputPane: View {
                     Text("MB").foregroundStyle(.secondary)
                 }
             }
-            Text("A recording that lands over the limit is shrunk right after encoding — smaller frame, then fewer frames — until it fits. You see the final size in the pill.")
+            Text("Record as long as you like. If the file comes out bigger, it is shrunk right after you finish — smaller frame, then fewer frames — until it fits. You see the final size in the pill.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .onAppear {

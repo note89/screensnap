@@ -97,7 +97,7 @@ private struct RecordingOptions: View {
                 Text(settings.sizeLimit.label).tag(settings.sizeLimit)
             }
         } label: {
-            Text("Size limit · \(settings.sizeLimit.label)")
+            Text("Shrink to fit · \(settings.sizeLimit.label)")
         }
         .pickerStyle(.menu)
     }

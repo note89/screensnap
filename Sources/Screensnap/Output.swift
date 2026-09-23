@@ -64,7 +64,7 @@ enum SizeLimit: Hashable, Codable {
     case bytes(Int64)
 
     static let presets: [(label: String, limit: SizeLimit)] = [
-        ("No limit", .none),
+        ("Keep original size", .none),
         ("8 MB · Discord free", .bytes(8 * 1_000_000)),
         ("25 MB · Gmail, Slack", .bytes(25 * 1_000_000)),
         ("100 MB · Signal", .bytes(100 * 1_000_000)),
@@ -72,7 +72,7 @@ enum SizeLimit: Hashable, Codable {
 
     var label: String {
         switch self {
-        case .none: return "No limit"
+        case .none: return "Off"
         case .bytes(let bytes): return ByteCount(bytes).formatted
         }
     }
