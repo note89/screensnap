@@ -76,6 +76,23 @@ enum GIFFrame {
         let delay = unclamped ?? clamped ?? 0.1
         return delay > 0 ? delay : 0.1
     }
+
+    /// The frame at `index`, decoded into pixels this process owns. An image straight
+    /// from ImageIO decodes lazily, and drawing it scaled makes CoreGraphics cache
+    /// decoded copies, even when each frame is released right after. Measured on
+    /// 3024x1964 frames, the cache grew to ~830 MB.
+    static func decodedImage(_ source: CGImageSource, index: Int) -> CGImage? {
+        guard let lazy = CGImageSourceCreateImageAtIndex(source, index, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let pixels = lazy.dataProvider?.data,
+              let provider = CGDataProvider(data: pixels),
+              let colorSpace = lazy.colorSpace else { return nil }
+        return CGImage(
+            width: lazy.width, height: lazy.height,
+            bitsPerComponent: lazy.bitsPerComponent, bitsPerPixel: lazy.bitsPerPixel, bytesPerRow: lazy.bytesPerRow,
+            space: colorSpace, bitmapInfo: lazy.bitmapInfo, provider: provider,
+            decode: nil, shouldInterpolate: true, intent: .defaultIntent
+        )
+    }
 }
 
 enum Thumbnail {
