@@ -126,8 +126,8 @@ enum Compressor {
             try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
             destination = recording.url
         case .sibling:
-            destination = uniqueURL(
-                folder: recording.url.deletingLastPathComponent(),
+            destination = FileManager.default.unusedURL(
+                in: recording.url.deletingLastPathComponent(),
                 stem: "\(recording.name)-\(target.fileSuffix)",
                 pathExtension: recording.url.pathExtension
             )
@@ -142,16 +142,6 @@ enum Compressor {
     private static func fileSize(_ url: URL) -> ByteCount {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return ByteCount((attributes?[.size] as? NSNumber)?.int64Value ?? 0)
-    }
-
-    private static func uniqueURL(folder: URL, stem: String, pathExtension: String) -> URL {
-        var candidate = folder.appendingPathComponent(stem).appendingPathExtension(pathExtension)
-        var counter = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = folder.appendingPathComponent("\(stem)-\(counter)").appendingPathExtension(pathExtension)
-            counter += 1
-        }
-        return candidate
     }
 
     // MARK: MP4

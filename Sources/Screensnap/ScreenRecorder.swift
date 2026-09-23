@@ -24,21 +24,24 @@ enum CaptureSource {
     /// A single window — works even when the window is in a different Space.
     case window(SCWindow)
 
-    /// Output dimensions in pixels (accounting for the backing scale on
+    /// Output dimensions in whole pixels (accounting for the backing scale on
     /// Retina displays). The region case already carries pixel-space rects;
-    /// the others are in points and need to be scaled here.
+    /// the others are in points and need to be scaled here. The stream, the
+    /// encoder and the HUD all read this one value.
     var pixelSize: CGSize {
+        let size: CGSize
         switch self {
         case .region(let r):
-            return r.pixelRect.size
+            size = r.pixelRect.size
         case .display(let d):
             let scale = NSScreen.screen(displayID: d.displayID)?.backingScaleFactor ?? 2
-            return CGSize(width: CGFloat(d.width) * scale, height: CGFloat(d.height) * scale)
+            size = CGSize(width: CGFloat(d.width) * scale, height: CGFloat(d.height) * scale)
         case .window(let w):
             let midPoint = CGPoint(x: w.frame.midX, y: w.frame.midY)
             let scale = NSScreen.screens.first(where: { $0.frame.contains(midPoint) })?.backingScaleFactor ?? 2
-            return CGSize(width: w.frame.width * scale, height: w.frame.height * scale)
+            size = CGSize(width: w.frame.width * scale, height: w.frame.height * scale)
         }
+        return CGSize(width: size.width.rounded(.down), height: size.height.rounded(.down))
     }
 
     /// Where the captured area sits on screen, in AppKit points (bottom-left origin).
@@ -77,6 +80,8 @@ enum ScreenRecorderError: Error {
 enum StopReason {
     case finish
     case discard
+    /// Discard, then record the same source again without asking what to record.
+    case restart
 }
 
 /// Wraps `SCStream`. Owns the recording lifecycle and
@@ -85,15 +90,10 @@ enum StopReason {
 @MainActor
 final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let source: CaptureSource
-    private let framerate: Int
+    private let framerate: Framerate
     private let captureCursor: Bool
     private let excludeWindowIDs: [CGWindowID]
     private weak var sink: FrameSink?
-
-    private struct FrameThrottle {
-        var startHostTime: CFTimeInterval
-        var lastEmittedTime: CFTimeInterval
-    }
 
     private enum CaptureState {
         case idle
@@ -103,22 +103,24 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var captureState: CaptureState = .idle
     private let frameQueue = DispatchQueue(label: "Screensnap.frameQueue")
 
-    private let throttle = OSAllocatedUnfairLock(
-        initialState: FrameThrottle(startHostTime: 0, lastEmittedTime: -.infinity))
-    private let isCapturingFlag = OSAllocatedUnfairLock(initialState: false)
-
-    /// The pixel size of the output, available after `start()` succeeds.
-    private(set) var pixelSize: CGSize = .zero
+    /// Frame pacing, shared with the capture queue. While `.stopped` every frame is
+    /// dropped; while `.running` at most one per frame interval passes. One value,
+    /// so "capturing but no start time" cannot be represented.
+    private enum FrameClock {
+        case stopped
+        case running(startedAt: CFTimeInterval, lastEmitted: CFTimeInterval?)
+    }
+    private let clock = OSAllocatedUnfairLock(initialState: FrameClock.stopped)
 
     init(
         source: CaptureSource,
-        framerate: Int,
+        framerate: Framerate,
         captureCursor: Bool,
         excludeWindowIDs: [CGWindowID] = [],
         sink: FrameSink
     ) {
         self.source = source
-        self.framerate = max(1, framerate)
+        self.framerate = framerate
         self.captureCursor = captureCursor
         self.excludeWindowIDs = excludeWindowIDs
         self.sink = sink
@@ -133,8 +135,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 6
         // `minimumFrameInterval` is a *floor*, not a hard rate. We still throttle in software
         // to keep encoder timestamps regular.
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(framerate))
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(framerate.fps))
         config.colorSpaceName = CGColorSpace.sRGB
+        config.width = Int(source.pixelSize.width)
+        config.height = Int(source.pixelSize.height)
 
         let filter: SCContentFilter
         switch source {
@@ -144,30 +148,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 throw ScreenRecorderError.displayNotFound
             }
             config.sourceRect = region.pixelRect
-            config.width = Int(region.pixelRect.width)
-            config.height = Int(region.pixelRect.height)
-            pixelSize = region.pixelRect.size
             filter = Self.displayFilter(display: display, content: content, excludeWindowIDs: excludeWindowIDs)
 
         case .display(let display):
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            // Find the NSScreen matching this display for correct Retina scale
-            let scale = NSScreen.screen(displayID: display.displayID)?.backingScaleFactor ?? 2
-            let w = Int(Double(display.width) * scale)
-            let h = Int(Double(display.height) * scale)
-            config.width = w
-            config.height = h
-            pixelSize = CGSize(width: w, height: h)
             filter = Self.displayFilter(display: display, content: content, excludeWindowIDs: excludeWindowIDs)
 
         case .window(let window):
             // `desktopIndependentWindow` captures the window across Space changes
             // and remains valid even when the window is minimized or on another Space.
-            let midPoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
-            let scale = NSScreen.screens.first(where: { $0.frame.contains(midPoint) })?.backingScaleFactor ?? 2
-            config.width = Int(window.frame.size.width * scale)
-            config.height = Int(window.frame.size.height * scale)
-            pixelSize = CGSize(width: config.width, height: config.height)
             filter = SCContentFilter(desktopIndependentWindow: window)
         }
 
@@ -175,11 +164,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
         try await stream.startCapture()
 
-        throttle.withLock { state in
-            state.startHostTime = CACurrentMediaTime()
-            state.lastEmittedTime = -.infinity
-        }
-        isCapturingFlag.withLock { $0 = true }
+        clock.withLock { $0 = .running(startedAt: CACurrentMediaTime(), lastEmitted: nil) }
         self.captureState = .capturing(stream: stream)
     }
 
@@ -199,7 +184,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() async {
         guard case .capturing(let stream) = captureState else { return }
         self.captureState = .stopped
-        isCapturingFlag.withLock { $0 = false }
+        clock.withLock { $0 = .stopped }
         try? await stream.stopCapture()
     }
 
@@ -217,21 +202,19 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
 
-        guard isCapturingFlag.withLock({ $0 }) else { return }
-
-
-        let (shouldEmit, elapsed, hostTime) = throttle.withLock { state -> (Bool, CFTimeInterval, CFTimeInterval) in
+        let interval = 1.0 / Double(framerate.fps)
+        let tick: (elapsed: CFTimeInterval, hostTime: CFTimeInterval)? = clock.withLock { state in
+            guard case .running(let startedAt, let lastEmitted) = state else { return nil }
             let now = CACurrentMediaTime()
-            let e = now - state.startHostTime
-            let interval = 1.0 / Double(framerate)
-            guard e - state.lastEmittedTime >= interval else { return (false, e, now) }
-            state.lastEmittedTime = e
-            return (true, e, now)
+            let elapsed = now - startedAt
+            if let lastEmitted, elapsed - lastEmitted < interval { return nil }
+            state = .running(startedAt: startedAt, lastEmitted: elapsed)
+            return (elapsed, now)
         }
-        guard shouldEmit else { return }
+        guard let tick else { return }
 
         guard let cgImage = sampleBuffer.cgImage() else { return }
-        let frame = CapturedFrame(image: cgImage, timestamp: elapsed, hostTime: hostTime)
+        let frame = CapturedFrame(image: cgImage, timestamp: tick.elapsed, hostTime: tick.hostTime)
         Task { @MainActor [weak self] in
             self?.sink?.sinkDidCapture(frame: frame)
         }

@@ -50,7 +50,7 @@ final class HUDPanel {
     func render(_ phase: Phase) {
         switch phase {
         case .idle, .pickingSource: hide()
-        case .countingDown, .recording, .finishing, .settled: show()
+        case .starting, .countingDown, .recording, .finishing, .settled: show()
         }
     }
 

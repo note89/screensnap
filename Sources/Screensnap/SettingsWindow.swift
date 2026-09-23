@@ -85,8 +85,9 @@ private struct CapturePane: View {
         self.settings = coordinator.settings
     }
 
-    private static let delays = [0, 3, 5, 10]
-    private static let framerates = [10, 15, 24, 30]
+    private static let delays = [0, 3, 5, 10].map(StartDelay.init(clamping:))
+    private static let gifFramerates = [10, 15, 24, 30].map(Framerate.init(clamping:))
+    private static let mp4Framerates = [24, 30, 60].map(Framerate.init(clamping:))
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -118,24 +119,14 @@ private struct CapturePane: View {
                 Text("Start delay")
                 Spacer()
                 Picker("", selection: $settings.startDelay) {
-                    ForEach(Self.delays, id: \.self) { Text($0 == 0 ? "None" : "\($0) s").tag($0) }
+                    ForEach(Self.delays, id: \.self) { Text($0.seconds == 0 ? "None" : "\($0.seconds) s").tag($0) }
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 260)
             }
-            HStack {
-                Text("Frame rate")
-                Spacer()
-                Picker("", selection: $settings.framerate) {
-                    ForEach(Self.framerates, id: \.self) { Text("\($0) fps").tag($0) }
-                    if !Self.framerates.contains(settings.framerate) {
-                        Text("\(settings.framerate) fps").tag(settings.framerate)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 260)
-            }
-            Text("15 fps is the sweet spot for UI walkthroughs — files stay small and motion reads fine.")
+            FrameratePicker(title: "GIF frame rate", selection: $settings.gifFramerate, choices: Self.gifFramerates)
+            FrameratePicker(title: "MP4 frame rate", selection: $settings.mp4Framerate, choices: Self.mp4Framerates)
+            Text("15 fps is the sweet spot for GIF walkthroughs — files stay small and motion reads fine. MP4 handles 30 or 60 fps without much growth.")
                 .font(.caption).foregroundStyle(.secondary)
 
             Divider().padding(.vertical, 4)
@@ -150,6 +141,27 @@ private struct CapturePane: View {
         case .region: return "Drag a rectangle on any screen."
         case .display: return "One whole screen. No question if you only have one."
         case .window: return "Follows the window, even to another Space."
+        }
+    }
+}
+
+private struct FrameratePicker: View {
+    let title: String
+    @Binding var selection: Framerate
+    let choices: [Framerate]
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Picker("", selection: $selection) {
+                ForEach(choices, id: \.self) { Text("\($0.fps) fps").tag($0) }
+                if !choices.contains(selection) {
+                    Text("\(selection.fps) fps").tag(selection)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 260)
         }
     }
 }
@@ -306,7 +318,11 @@ private struct OutputPane: View {
                 set: { choice in
                     switch choice {
                     case .preset(let limit): settings.sizeLimit = limit
-                    case .custom: settings.sizeLimit = .bytes(Int64((Int(customMB) ?? 50) * 1_000_000))
+                    case .custom:
+                        // Picked before typing a usable number: start from 50 MB.
+                        if let ceiling = SizeLimit.Ceiling(megabytesText: customMB) ?? SizeLimit.Ceiling(megabytes: 50) {
+                            settings.sizeLimit = .atMost(ceiling)
+                        }
                     }
                 }
             )) {
@@ -322,7 +338,7 @@ private struct OutputPane: View {
                     TextField("MB", text: $customMB)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 80)
-                        .onSubmit { if let mb = Int(customMB), mb > 0 { settings.sizeLimit = .bytes(Int64(mb) * 1_000_000) } }
+                        .onSubmit { if let ceiling = SizeLimit.Ceiling(megabytesText: customMB) { settings.sizeLimit = .atMost(ceiling) } }
                     Text("MB").foregroundStyle(.secondary)
                 }
             }
@@ -330,7 +346,7 @@ private struct OutputPane: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         .onAppear {
-            if case .bytes(let bytes) = settings.sizeLimit { customMB = String(bytes / 1_000_000) }
+            if case .atMost(let ceiling) = settings.sizeLimit { customMB = String(ceiling.megabytes) }
         }
     }
 }
@@ -466,13 +482,15 @@ private struct RecordingsPane: View {
             Divider().padding(.vertical, 4)
 
             SectionLabel("AFTER SAVING")
-            Toggle("Copy to clipboard — ⌘V pastes the file", isOn: $settings.delivery.copyToClipboard)
-            Toggle("Reveal in Finder", isOn: $settings.delivery.revealInFinder)
-            HStack {
-                Text("File names")
-                TextField("", text: $settings.filenameFormat).textFieldStyle(.roundedBorder).frame(width: 220)
-                Text("%Y %m %d %H %M %S").font(.caption).foregroundStyle(.secondary)
+            Picker("Copy to clipboard", selection: $settings.delivery.clipboard) {
+                ForEach(ClipboardCopy.allCases, id: \.self) { Text($0.label).tag($0) }
             }
+            .pickerStyle(.segmented)
+            .frame(width: 360)
+            Text("⌘V then pastes the file. GIFs only suits chats and issues; MP4s are usually uploaded instead.")
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle("Reveal in Finder", isOn: $settings.delivery.revealInFinder)
+            FilenameField(settings: settings)
 
             Divider().padding(.vertical, 4)
 
@@ -507,14 +525,49 @@ private struct RecordingsPane: View {
     }
 }
 
+/// Edits the file name template. What is typed is a draft; the setting changes only
+/// when the draft parses, and the line underneath says why when it does not.
+private struct FilenameField: View {
+    @Bindable var settings: Settings
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("File names")
+                TextField("", text: $draft).textFieldStyle(.roundedBorder).frame(width: 220)
+                Text("%Y %m %d %H %M %S").font(.caption).foregroundStyle(.secondary)
+            }
+            switch FilenameTemplate.parse(draft) {
+            case .success(let template):
+                Text("Next: \(template.stem(at: Date())).\(settings.output.fileExtension)")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .failure(let error):
+                Text("\(error.message) Still using \(settings.filenameTemplate.text).")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        }
+        .onAppear { draft = settings.filenameTemplate.text }
+        .onChange(of: draft) { _, text in
+            if case .success(let template) = FilenameTemplate.parse(text) { settings.filenameTemplate = template }
+        }
+    }
+}
+
 private struct RecordingRow: View {
     let recording: Recording
     let coordinator: Coordinator
 
-    @State private var editing = false
-    @State private var draftName = ""
+    /// A draft name exists only while renaming, so there is no stale draft to commit.
+    private enum NameEdit: Equatable {
+        case showing
+        case renaming(draft: String)
+    }
+
+    @State private var nameEdit: NameEdit = .showing
     @State private var compressing = false
     @State private var message: String?
+    @State private var thumbnailHovered = false
 
     private var library: RecordingsStore { coordinator.library }
     private var job: CompressionJob? { coordinator.compression?.recording == recording ? coordinator.compression : nil }
@@ -530,14 +583,15 @@ private struct RecordingRow: View {
         HStack(spacing: 12) {
             thumbnail
             VStack(alignment: .leading, spacing: 3) {
-                if editing {
-                    TextField("Name", text: $draftName, onCommit: commitRename)
+                switch nameEdit {
+                case .renaming(let draft):
+                    TextField("Name", text: Binding(get: { draft }, set: { nameEdit = .renaming(draft: $0) }), onCommit: { commitRename(draft) })
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 260)
-                        .onExitCommand { editing = false }
-                } else {
+                        .onExitCommand { nameEdit = .showing }
+                case .showing:
                     Text(recording.name).fontWeight(.medium).lineLimit(1)
-                        .onTapGesture(count: 2) { draftName = recording.name; editing = true }
+                        .onTapGesture(count: 2) { nameEdit = .renaming(draft: recording.name) }
                 }
                 Text(meta).font(.caption).foregroundStyle(.secondary)
                 if let job {
@@ -549,12 +603,13 @@ private struct RecordingRow: View {
             }
             Spacer()
             HStack(spacing: 4) {
+                iconButton("play.fill", help: "Play") { library.play(recording) }
                 iconButton("doc.on.doc", help: "Copy — ⌘V pastes it") { Clipboard.copy(recording.url) }
                 iconButton("magnifyingglass", help: "Show in Finder") { library.reveal(recording) }
                 Button {
                     compressing = true
                 } label: {
-                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    Image(systemName: "rectangle.compress.vertical")
                 }
                 .buttonStyle(.plain)
                 .help("Compress…")
@@ -581,8 +636,17 @@ private struct RecordingRow: View {
             } else {
                 Image(systemName: recording.container == .gif ? "photo.stack" : "film").foregroundStyle(.secondary)
             }
+            if thumbnailHovered {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 22))
+                    .foregroundStyle(.white, .black.opacity(0.55))
+            }
         }
         .frame(width: 88, height: 56)
+        .contentShape(Rectangle())
+        .onHover { thumbnailHovered = $0 }
+        .onTapGesture { library.play(recording) }
+        .help("Play")
     }
 
     private var meta: String {
@@ -602,9 +666,9 @@ private struct RecordingRow: View {
             .help(help)
     }
 
-    private func commitRename() {
-        editing = false
-        do { try library.rename(recording, to: draftName) } catch { message = error.localizedDescription }
+    private func commitRename(_ draft: String) {
+        nameEdit = .showing
+        do { try library.rename(recording, to: draft) } catch { message = error.localizedDescription }
     }
 
     private func run(target: CompressionTarget, placement: CompressionPlacement) async {

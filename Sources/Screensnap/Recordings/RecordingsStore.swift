@@ -1,6 +1,21 @@
 import AppKit
 import Observation
 
+/// What reading one fact from a file produced. A file missing from a cache has not
+/// been read yet; one that failed stays `.unreadable` instead of being retried on
+/// every redraw.
+enum ReadOutcome<Value> {
+    case read(Value)
+    case unreadable
+
+    var value: Value? {
+        switch self {
+        case .read(let value): return value
+        case .unreadable: return nil
+        }
+    }
+}
+
 /// The recordings folder, as a list. Rescans when the folder changes on disk, so
 /// files renamed or trashed in Finder disappear here too.
 @MainActor @Observable
@@ -8,9 +23,15 @@ final class RecordingsStore {
     private(set) var folder: URL
     /// Newest first.
     private(set) var recordings: [Recording] = []
-    private(set) var infos: [URL: MediaInfo] = [:]
-    private(set) var thumbnails: [URL: CGImage] = [:]
+    /// Keyed by the whole `Recording` (URL, size, creation date), so a file replaced
+    /// in place — a size-limit shrink — is a new key and never shows stale facts.
+    private(set) var infos: [Recording: ReadOutcome<MediaInfo>] = [:]
+    private(set) var thumbnails: [Recording: ReadOutcome<CGImage>] = [:]
 
+    /// Reads in flight. Not observed: views call `info(for:)` from `body`, and
+    /// marking a read as started must not trigger another redraw.
+    @ObservationIgnored private var readingInfo: Set<Recording> = []
+    @ObservationIgnored private var readingThumbnail: Set<Recording> = []
     @ObservationIgnored private var watcher: DispatchSourceFileSystemObject?
     @ObservationIgnored private var rescanTask: Task<Void, Never>?
 
@@ -35,7 +56,7 @@ final class RecordingsStore {
     func rescan() {
         let urls = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
         recordings = urls.compactMap(Recording.init(url:)).sorted { $0.createdAt > $1.createdAt }
-        let live = Set(recordings.map(\.url))
+        let live = Set(recordings)
         infos = infos.filter { live.contains($0.key) }
         thumbnails = thumbnails.filter { live.contains($0.key) }
     }
@@ -44,22 +65,38 @@ final class RecordingsStore {
         recordings.first { $0.url == url }
     }
 
+    /// The cached info, or nil while it is being read (one read per file, started
+    /// by the first ask) or when the file cannot be read.
     func info(for recording: Recording) -> MediaInfo? {
-        if let cached = infos[recording.url] { return cached }
+        if let outcome = infos[recording] { return outcome.value }
+        guard readingInfo.insert(recording).inserted else { return nil }
         Task {
-            guard let loaded = await MediaInfo.load(recording) else { return }
-            infos[recording.url] = loaded
+            let loaded = await MediaInfo.load(recording)
+            readingInfo.remove(recording)
+            guard recordings.contains(recording) else { return }
+            infos[recording] = loaded.map(ReadOutcome.read) ?? .unreadable
         }
         return nil
     }
 
     func thumbnail(for recording: Recording) -> CGImage? {
-        if let cached = thumbnails[recording.url] { return cached }
+        if let outcome = thumbnails[recording] { return outcome.value }
+        guard readingThumbnail.insert(recording).inserted else { return nil }
         Task {
-            guard let image = await Thumbnail.make(for: recording) else { return }
-            thumbnails[recording.url] = image
+            let image = await Thumbnail.make(for: recording)
+            readingThumbnail.remove(recording)
+            // A read that finishes after its file was trashed, replaced or left behind
+            // by a folder change must not re-add it to the cache.
+            guard recordings.contains(recording) else { return }
+            thumbnails[recording] = image.map(ReadOutcome.read) ?? .unreadable
         }
         return nil
+    }
+
+    /// Plays it in the user's default app for the type — QuickTime Player for MP4 unless
+    /// they changed it.
+    func play(_ recording: Recording) {
+        NSWorkspace.shared.open(recording.url)
     }
 
     func reveal(_ recording: Recording) {

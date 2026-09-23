@@ -34,6 +34,13 @@ enum Output: Equatable, Codable {
         }
     }
 
+    var container: OutputContainer {
+        switch self {
+        case .gif: return .gif
+        case .mp4: return .mp4
+        }
+    }
+
     var recordsMicrophone: Bool {
         self == .mp4(.microphone)
     }
@@ -59,28 +66,43 @@ enum OutputContainer: String, Codable, CaseIterable {
 
 /// An upper bound on the finished file. Shared per-service ceilings are named so the
 /// user picks "Signal" rather than remembering a number.
-enum SizeLimit: Hashable, Codable {
+enum SizeLimit: Hashable {
     case none
-    case bytes(Int64)
+    case atMost(Ceiling)
 
-    static let presets: [(label: String, limit: SizeLimit)] = [
-        ("Keep original size", .none),
-        ("8 MB · Discord free", .bytes(8 * 1_000_000)),
-        ("25 MB · Gmail, Slack", .bytes(25 * 1_000_000)),
-        ("100 MB · Signal", .bytes(100 * 1_000_000)),
-    ]
+    /// A positive file size. Zero or negative ceilings cannot be built, so a limit
+    /// that no file could ever meet is not a state the app can be in.
+    struct Ceiling: Hashable {
+        let size: ByteCount
+
+        init?(bytes: Int64) {
+            guard bytes > 0 else { return nil }
+            size = ByteCount(bytes)
+        }
+
+        init?(megabytes: Int) {
+            guard megabytes > 0 else { return nil }
+            self.init(bytes: Int64(megabytes) * 1_000_000)
+        }
+
+        /// What the user typed into the custom field, e.g. " 40 ".
+        init?(megabytesText text: String) {
+            guard let megabytes = Int(text.trimmingCharacters(in: .whitespaces)) else { return nil }
+            self.init(megabytes: megabytes)
+        }
+
+        var megabytes: Int { Int(size.bytes / 1_000_000) }
+    }
+
+    static let presets: [(label: String, limit: SizeLimit)] = [("Keep original size", .none)]
+        + [(8, "Discord free"), (25, "Gmail, Slack"), (100, "Signal")].compactMap { megabytes, service in
+            Ceiling(megabytes: megabytes).map { ("\(megabytes) MB · \(service)", .atMost($0)) }
+        }
 
     var label: String {
         switch self {
         case .none: return "Off"
-        case .bytes(let bytes): return ByteCount(bytes).formatted
-        }
-    }
-
-    func fits(_ bytes: Int64) -> Bool {
-        switch self {
-        case .none: return true
-        case .bytes(let limit): return bytes <= limit
+        case .atMost(let ceiling): return ceiling.size.formatted
         }
     }
 }

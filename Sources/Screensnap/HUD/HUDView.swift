@@ -13,6 +13,10 @@ struct HUDView: View {
             switch coordinator.phase {
             case .idle, .pickingSource:
                 EmptyView()
+            case .starting(let output):
+                ProgressView().controlSize(.small).tint(.white)
+                Text("Starting \(output.label)…").foregroundStyle(.white.opacity(0.85))
+                Spacer(minLength: 0)
             case .countingDown(let remaining, let output):
                 Text("\(remaining)")
                     .font(.system(size: 22, weight: .bold, design: .rounded))
@@ -23,7 +27,7 @@ struct HUDView: View {
                 Spacer(minLength: 0)
                 PillButton(title: "Cancel", role: .quiet) { coordinator.cancelCountdown() }
             case .recording(let run):
-                RecordingRow(run: run, micLevel: coordinator.micLevel, finish: coordinator.finish, discard: coordinator.discard)
+                RecordingRow(run: run, micLevel: coordinator.micLevel, finish: coordinator.finish, restart: coordinator.restart, discard: coordinator.discard)
             case .finishing(let step):
                 ProgressView().controlSize(.small).tint(.white)
                 Text(step.label).foregroundStyle(.white.opacity(0.85))
@@ -51,6 +55,7 @@ private struct RecordingRow: View {
     let run: RecordingRun
     let micLevel: Float
     let finish: () -> Void
+    let restart: () -> Void
     let discard: () -> Void
 
     @State private var pulse = false
@@ -75,6 +80,8 @@ private struct RecordingRow: View {
         Spacer(minLength: 4)
         PillButton(title: "Finish", role: .primary, action: finish)
             .help("⌘⇧.")
+        PillButton(systemImage: "arrow.counterclockwise", role: .quiet, action: restart)
+            .help("Start over")
         PillButton(systemImage: "xmark", role: .quiet, action: discard)
             .help("Discard")
     }
@@ -94,7 +101,7 @@ private struct SettledRow: View {
         case .saved(let recording, let notes):
             Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.green)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Saved · \(recording.bytes.formatted)\(coordinator.settings.delivery.copyToClipboard ? " · ⌘V to paste" : "")")
+                Text("Saved · \(recording.bytes.formatted)\(coordinator.settings.delivery.clipboard.applies(to: OutputContainer(url: recording.url)) ? " · ⌘V to paste" : "")")
                     .foregroundStyle(.white)
                 if !notes.isEmpty {
                     Text(notes.joined(separator: " · ")).font(.caption).foregroundStyle(.orange).lineLimit(1)

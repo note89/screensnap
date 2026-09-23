@@ -46,6 +46,8 @@ enum Settlement: Equatable {
 enum Phase: Equatable {
     case idle
     case pickingSource(CaptureMode)
+    /// The source is chosen; devices, permissions and the encoder are coming up.
+    case starting(Output)
     case countingDown(remaining: Int, output: Output)
     case recording(RecordingRun)
     case finishing(FinishStep)
@@ -54,7 +56,7 @@ enum Phase: Equatable {
     var isBusy: Bool {
         switch self {
         case .idle, .settled: return false
-        case .pickingSource, .countingDown, .recording, .finishing: return true
+        case .pickingSource, .starting, .countingDown, .recording, .finishing: return true
         }
     }
 }

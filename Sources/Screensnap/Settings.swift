@@ -2,25 +2,42 @@ import Foundation
 import Observation
 
 enum CaptureMode: String, CaseIterable, Codable {
-    case region
     case display
     case window
+    case region
 
     var label: String {
         switch self {
-        case .region: return "Area"
         case .display: return "Full screen"
         case .window: return "Window"
+        case .region: return "Area"
         }
     }
 
     var icon: String {
         switch self {
-        case .region: return "rectangle.dashed"
         case .display: return "display"
         case .window: return "macwindow"
+        case .region: return "rectangle.dashed"
         }
     }
+}
+
+/// Seconds between choosing what to record and the first frame. Always within
+/// `range`: the value is clamped once, when it is made, so no setter has to.
+struct StartDelay: Hashable {
+    static let range = 0...10
+    let seconds: Int
+
+    init(clamping seconds: Int) { self.seconds = seconds.clamped(to: Self.range) }
+}
+
+/// Frames captured per second. Always within `range`, for the same reason.
+struct Framerate: Hashable {
+    static let range = 1...60
+    let fps: Int
+
+    init(clamping fps: Int) { self.fps = fps.clamped(to: Self.range) }
 }
 
 enum Facecam: String, CaseIterable, Codable {
@@ -28,9 +45,33 @@ enum Facecam: String, CaseIterable, Codable {
     case bubble
 }
 
+/// Which finished recordings land on the clipboard. GIFs are what people paste
+/// into chats and issues; MP4s are usually uploaded or kept.
+enum ClipboardCopy: String, CaseIterable, Codable {
+    case always
+    case gifsOnly
+    case never
+
+    var label: String {
+        switch self {
+        case .always: return "Always"
+        case .gifsOnly: return "GIFs only"
+        case .never: return "Never"
+        }
+    }
+
+    func applies(to output: OutputContainer) -> Bool {
+        switch self {
+        case .always: return true
+        case .gifsOnly: return output == .gif
+        case .never: return false
+        }
+    }
+}
+
 /// Where a finished recording goes beyond the recordings folder.
 struct Delivery: Equatable, Codable {
-    var copyToClipboard: Bool
+    var clipboard: ClipboardCopy
     var revealInFinder: Bool
 }
 
@@ -39,7 +80,10 @@ struct Delivery: Equatable, Codable {
 @MainActor @Observable
 final class Settings {
     private enum Key {
+        /// Legacy single rate, read once to seed `gifFramerate`.
         static let framerate = "recording.framerate"
+        static let gifFramerate = "recording.framerate.gif"
+        static let mp4Framerate = "recording.framerate.mp4"
         static let startDelay = "recording.startDelay"
         static let captureCursor = "recording.captureCursor"
         static let outputContainer = "recording.outputContainer"
@@ -49,20 +93,27 @@ final class Settings {
         static let facecam = "recording.facecam"
         static let sizeLimitBytes = "recording.sizeLimitBytes"
         static let revealInFinder = "interface.revealInFinder"
+        /// Legacy on/off switch, read once to seed `clipboardCopy`.
         static let copyToClipboard = "interface.copyToClipboard"
+        static let clipboardCopy = "interface.clipboardCopy"
         static let saveFolder = "persist.saveFolder"
         static let filenameFormat = "interface.filenameFormat"
         static let lastUpdateCheck = "updates.lastCheck"
     }
 
-    static let defaultFilenameFormat = "%Y-%m-%dT%H-%M-%S"
-    static let framerateRange = 1...60
-    static let startDelayRange = 0...10
-
     @ObservationIgnored private let defaults: UserDefaults
 
-    var framerate: Int { didSet { framerate = framerate.clamped(to: Self.framerateRange); defaults.set(framerate, forKey: Key.framerate) } }
-    var startDelay: Int { didSet { startDelay = startDelay.clamped(to: Self.startDelayRange); defaults.set(startDelay, forKey: Key.startDelay) } }
+    /// GIFs stay small at low rates; MP4 compresses motion well, so it can afford more.
+    var gifFramerate: Framerate { didSet { defaults.set(gifFramerate.fps, forKey: Key.gifFramerate) } }
+    var mp4Framerate: Framerate { didSet { defaults.set(mp4Framerate.fps, forKey: Key.mp4Framerate) } }
+
+    func framerate(for container: OutputContainer) -> Framerate {
+        switch container {
+        case .gif: return gifFramerate
+        case .mp4: return mp4Framerate
+        }
+    }
+    var startDelay: StartDelay { didSet { defaults.set(startDelay.seconds, forKey: Key.startDelay) } }
     var captureCursor: Bool { didSet { defaults.set(captureCursor, forKey: Key.captureCursor) } }
     var outputContainer: OutputContainer { didSet { defaults.set(outputContainer.rawValue, forKey: Key.outputContainer) } }
     var gifQuality: GifQuality { didSet { defaults.set(gifQuality.rawValue, forKey: Key.gifQuality) } }
@@ -73,17 +124,17 @@ final class Settings {
         didSet {
             switch sizeLimit {
             case .none: defaults.set(0, forKey: Key.sizeLimitBytes)
-            case .bytes(let bytes): defaults.set(bytes, forKey: Key.sizeLimitBytes)
+            case .atMost(let ceiling): defaults.set(ceiling.size.bytes, forKey: Key.sizeLimitBytes)
             }
         }
     }
     var delivery: Delivery {
         didSet {
-            defaults.set(delivery.copyToClipboard, forKey: Key.copyToClipboard)
+            defaults.set(delivery.clipboard.rawValue, forKey: Key.clipboardCopy)
             defaults.set(delivery.revealInFinder, forKey: Key.revealInFinder)
         }
     }
-    var filenameFormat: String { didSet { defaults.set(filenameFormat, forKey: Key.filenameFormat) } }
+    var filenameTemplate: FilenameTemplate { didSet { defaults.set(filenameTemplate.text, forKey: Key.filenameFormat) } }
     var saveFolder: URL { didSet { defaults.set(saveFolder.path, forKey: Key.saveFolder) } }
     var lastUpdateCheck: Date? { didSet { defaults.set(lastUpdateCheck, forKey: Key.lastUpdateCheck) } }
 
@@ -95,28 +146,28 @@ final class Settings {
         self.defaults = defaults
         defaults.register(defaults: [
             Key.framerate: 15,
+            Key.mp4Framerate: 30,
             Key.startDelay: 0,
             Key.captureCursor: true,
-            Key.copyToClipboard: true,
             Key.revealInFinder: false,
             Key.sizeLimitBytes: 100_000_000,
-            Key.filenameFormat: Self.defaultFilenameFormat,
         ])
-        framerate = defaults.integer(forKey: Key.framerate).clamped(to: Self.framerateRange)
-        startDelay = defaults.integer(forKey: Key.startDelay).clamped(to: Self.startDelayRange)
+        gifFramerate = Framerate(clamping: defaults.object(forKey: Key.gifFramerate) as? Int ?? defaults.integer(forKey: Key.framerate))
+        mp4Framerate = Framerate(clamping: defaults.integer(forKey: Key.mp4Framerate))
+        startDelay = StartDelay(clamping: defaults.integer(forKey: Key.startDelay))
         captureCursor = defaults.bool(forKey: Key.captureCursor)
         outputContainer = OutputContainer(rawValue: defaults.string(forKey: Key.outputContainer) ?? "") ?? .gif
         gifQuality = GifQuality(rawValue: defaults.string(forKey: Key.gifQuality) ?? "") ?? .fast
         audioTrack = AudioTrack(rawValue: defaults.string(forKey: Key.audioTrack) ?? "") ?? .microphone
         captureMode = CaptureMode(rawValue: defaults.string(forKey: Key.captureMode) ?? "") ?? .region
         facecam = Facecam(rawValue: defaults.string(forKey: Key.facecam) ?? "") ?? .off
-        let limitBytes = Int64(defaults.integer(forKey: Key.sizeLimitBytes))
-        sizeLimit = limitBytes > 0 ? .bytes(limitBytes) : .none
+        sizeLimit = SizeLimit.Ceiling(bytes: Int64(defaults.integer(forKey: Key.sizeLimitBytes))).map(SizeLimit.atMost) ?? .none
         delivery = Delivery(
-            copyToClipboard: defaults.bool(forKey: Key.copyToClipboard),
+            clipboard: ClipboardCopy(rawValue: defaults.string(forKey: Key.clipboardCopy) ?? "")
+                ?? (defaults.object(forKey: Key.copyToClipboard) as? Bool == false ? .never : .gifsOnly),
             revealInFinder: defaults.bool(forKey: Key.revealInFinder)
         )
-        filenameFormat = defaults.string(forKey: Key.filenameFormat) ?? Self.defaultFilenameFormat
+        filenameTemplate = FilenameTemplate.parseOrStandard(defaults.string(forKey: Key.filenameFormat))
         saveFolder = Self.resolveSaveFolder(stored: defaults.string(forKey: Key.saveFolder))
         lastUpdateCheck = defaults.object(forKey: Key.lastUpdateCheck) as? Date
     }
@@ -136,19 +187,10 @@ final class Settings {
         return legacyHasRecordings ? legacySaveFolder : defaultSaveFolder
     }
 
-    /// Sortable filename from `filenameFormat`; the default yields `2026-05-17T14-30-00.gif`.
-    func newRecordingURL(for output: Output) -> URL {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = filenameFormat
-            .replacingOccurrences(of: "%Y", with: "yyyy")
-            .replacingOccurrences(of: "%m", with: "MM")
-            .replacingOccurrences(of: "%d", with: "dd")
-            .replacingOccurrences(of: "%H", with: "HH")
-            .replacingOccurrences(of: "%M", with: "mm")
-            .replacingOccurrences(of: "%S", with: "ss")
-        let stem = formatter.string(from: Date())
-        return saveFolder.appendingPathComponent(stem).appendingPathExtension(output.fileExtension)
+    /// Where a recording started now gets saved: named by `filenameTemplate` (the
+    /// standard one yields `2026-05-17T14-30-00.gif`) and never an existing file.
+    func newRecordingURL(for output: Output, at date: Date = Date()) -> URL {
+        FileManager.default.unusedURL(in: saveFolder, stem: filenameTemplate.stem(at: date), pathExtension: output.fileExtension)
     }
 }
 

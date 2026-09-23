@@ -5,8 +5,6 @@ import CoreGraphics
 struct SelectedRegion {
     /// The display the region lives on.
     let displayID: CGDirectDisplayID
-    /// The display's full pixel size (already accounting for backing scale).
-    let displayPixelSize: CGSize
     /// The selection in *pixels*, top-left origin, relative to the display.
     /// This is the format ScreenCaptureKit's `sourceRect` expects.
     let pixelRect: CGRect
@@ -90,7 +88,6 @@ private final class OverlayWindow: NSPanel {
         let scale = screen.backingScaleFactor
 
         // Convert AppKit (bottom-left, points, screen-local) → CG (top-left, pixels, display-local).
-        let cgBounds = CGDisplayBounds(displayID)
         // viewRect is already in screen-local points (selection view fills the screen).
         let topLeftYPoints = screen.frame.size.height - (viewRect.origin.y + viewRect.size.height)
 
@@ -103,7 +100,6 @@ private final class OverlayWindow: NSPanel {
 
         let region = SelectedRegion(
             displayID: displayID,
-            displayPixelSize: CGSize(width: cgBounds.width * scale, height: cgBounds.height * scale),
             pixelRect: pixelRect.integral
         )
         owner?.finish(with: region)
