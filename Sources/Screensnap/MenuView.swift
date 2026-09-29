@@ -20,10 +20,10 @@ struct MenuView: View {
             }
             Button("Start over") { coordinator.restart() }
             Button("Discard recording") { coordinator.discard() }
-            Button("Hide or show controls  \(HUDPanel.presenceShortcut)") { coordinator.toggleControls() }
+            Button(controlsTitle) { coordinator.toggleControls() }
         case .countingDown:
             Button("Cancel countdown") { coordinator.cancelCountdown() }
-            Button("Hide or show controls  \(HUDPanel.presenceShortcut)") { coordinator.toggleControls() }
+            Button(controlsTitle) { coordinator.toggleControls() }
         case .idle, .settled, .pickingSource, .starting, .finishing:
             ForEach(CaptureMode.allCases, id: \.self) { mode in
                 Button {
@@ -47,7 +47,7 @@ struct MenuView: View {
             EmptyView()
         case .grantedSinceLaunch:
             Divider()
-            Button("Relaunch to activate Screen Recording") { Relaunch.now() }
+            Button("Relaunch to activate Screen Recording") { coordinator.relaunch() }
         case .missing:
             Divider()
             Button("⚠ Fix permissions…") { open(.capture) }
@@ -69,12 +69,18 @@ struct MenuView: View {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// The shortcut is named only while pressing it would do something.
+    private var controlsTitle: String {
+        coordinator.controlsKeys.map { "Hide or show controls  \($0)" } ?? "Hide or show controls"
+    }
+
     private var statusLine: String {
         switch coordinator.phase {
         case .idle:
+            if let job = coordinator.compression { return "compressing \(job.recording.name)…" }
             switch coordinator.screenRecordingAccess {
             case .granted:
-                guard let keys = coordinator.hotkey.advertisedKeys else { return "\(HotkeyRegistration.keys) unavailable — record from this menu" }
+                guard let keys = coordinator.hotkey.advertisedKeys else { return "\(coordinator.hotkey.keys) unavailable — record from this menu" }
                 return "\(keys) records \(coordinator.settings.captureMode.label.lowercased())"
             case .grantedSinceLaunch: return "Screen Recording granted — relaunch to activate"
             case .missing: return "Screen Recording permission missing"
@@ -86,7 +92,7 @@ struct MenuView: View {
             guard let keys = coordinator.hotkey.advertisedKeys else { return "recording \(run.output.label)" }
             return "recording \(run.output.label) — \(keys) to finish"
         case .finishing(let step): return step.label
-        case .settled(.saved(let recording, _)): return "saved \(recording.name) · \(recording.bytes.formatted)"
+        case .settled(.saved(let saved)): return "saved \(saved.recording.name) · \(saved.recording.bytes.formatted)"
         case .settled(.discarded): return "discarded"
         case .settled(.failed(let message)): return message
         }

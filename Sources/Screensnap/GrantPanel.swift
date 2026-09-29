@@ -72,8 +72,9 @@ final class GrantPanel {
         return panel
     }
 
-    private func place(beside settings: CGRect) {
+    private func place(beside settingsWindow: ScreenRect) {
         guard let panel else { return }
+        let settings = settingsWindow.cgRect
         let screen = NSScreen.screens.first { $0.frame.intersects(settings) } ?? NSScreen.main
         let visible = screen?.visibleFrame ?? settings
         var origin = CGPoint(x: settings.midX - Self.size.width / 2, y: settings.minY - Self.gap - Self.size.height)
@@ -88,10 +89,10 @@ final class GrantPanel {
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
 
-    /// Frame of System Settings' main window in Cocoa coordinates. Window bounds and
-    /// owner PIDs are readable without Screen Recording (titles are not), which
-    /// matters because this panel exists for users who don't have it yet.
-    private static func systemSettingsFrame() -> CGRect? {
+    /// Frame of System Settings' main window. Window bounds and owner PIDs are
+    /// readable without Screen Recording (titles are not), which matters because
+    /// this panel exists for users who don't have it yet.
+    private static func systemSettingsFrame() -> ScreenRect? {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: systemSettingsBundleID).first,
               let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
         else { return nil }
@@ -99,9 +100,8 @@ final class GrantPanel {
             .filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier && ($0[kCGWindowLayer as String] as? Int) == 0 }
             .compactMap { ($0[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) } }
             .max { $0.width * $0.height < $1.width * $1.height }
-        guard let bounds, let primaryHeight = NSScreen.screens.first?.frame.height else { return nil }
-        // CGWindowList is top-left-origin on the primary screen; AppKit is bottom-left.
-        return CGRect(x: bounds.minX, y: primaryHeight - bounds.maxY, width: bounds.width, height: bounds.height)
+        guard let bounds else { return nil }
+        return ScreenRect(topLeftOrigin: bounds)
     }
 }
 

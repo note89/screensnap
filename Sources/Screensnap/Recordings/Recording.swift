@@ -3,8 +3,9 @@ import AVFoundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// One file in the recordings folder. The folder is the library: anything with a
-/// recording extension counts, whether Screensnap made it or the user dropped it in.
+/// One file in the recordings folder. The folder is the library: anything whose
+/// extension names an `OutputContainer` counts, whether Screensnap made it or the
+/// user dropped it in.
 struct Recording: Identifiable, Equatable, Hashable {
     let url: URL
     let container: OutputContainer
@@ -14,14 +15,12 @@ struct Recording: Identifiable, Equatable, Hashable {
     var id: URL { url }
     var name: String { url.deletingPathExtension().lastPathComponent }
 
-    static let extensions: Set<String> = ["gif", "mp4"]
-
     init?(url: URL) {
-        guard Self.extensions.contains(url.pathExtension.lowercased()),
+        guard let container = OutputContainer(rawValue: url.pathExtension.lowercased()),
               let values = try? url.resourceValues(forKeys: [.creationDateKey, .fileSizeKey, .isRegularFileKey]),
               values.isRegularFile == true else { return nil }
         self.url = url
-        self.container = OutputContainer(url: url)
+        self.container = container
         self.createdAt = values.creationDate ?? .distantPast
         self.bytes = ByteCount(Int64(values.fileSize ?? 0))
     }
@@ -120,11 +119,11 @@ enum Thumbnail {
 enum Clipboard {
     /// Always the file URL (Finder, Slack, browsers take it); raw GIF bytes too, so
     /// image fields that ignore file URLs still get the animation.
-    static func copy(_ url: URL) {
+    static func copy(_ recording: Recording) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.writeObjects([url as NSURL])
-        if OutputContainer(url: url) == .gif, let data = try? Data(contentsOf: url) {
+        pasteboard.writeObjects([recording.url as NSURL])
+        if recording.container == .gif, let data = try? Data(contentsOf: recording.url) {
             pasteboard.setData(data, forType: NSPasteboard.PasteboardType(UTType.gif.identifier))
         }
     }

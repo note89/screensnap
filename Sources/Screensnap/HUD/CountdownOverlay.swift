@@ -27,9 +27,9 @@ final class CountdownOverlay {
         panel.contentView = NSHostingView(rootView: CountdownNumber(model: model))
     }
 
-    func show(_ remaining: Int, over area: CGRect) {
+    func show(_ remaining: Int, over area: ScreenRect) {
         model.remaining = remaining
-        if panel.frame != area { panel.setFrame(area, display: false) }
+        if panel.frame != area.cgRect { panel.setFrame(area.cgRect, display: false) }
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
 

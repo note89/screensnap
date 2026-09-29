@@ -4,14 +4,40 @@ import Observation
 import ScreenCaptureKit
 
 struct CompressionJob: Equatable {
+    /// Which entry point started it: the size limit after a recording, or the
+    /// Recordings pane.
+    enum Origin: Equatable {
+        case sizeLimit
+        case manual
+    }
+
     let recording: Recording
     let target: CompressionTarget
+    let placement: CompressionPlacement
+    let origin: Origin
     var progress: Double
 }
 
 enum CompressionOutcome: Equatable {
     case done(CompressionResult)
     case failed(String)
+}
+
+/// A recording's devices and encoder as `begin` brings them up, in order. Each is
+/// optional until it is up; `abandon()` releases whatever is, so every failure exit
+/// tears down the same way, and a device added here is released on all of them.
+@MainActor private struct SessionSetup {
+    var camera: CameraCapture?
+    var preview: FacecamPreviewWindow?
+    var microphone: MicrophoneCapture?
+    var encoder: EncoderSetup?
+
+    func abandon() {
+        encoder?.encoder.cancel()
+        microphone?.stop()
+        camera?.stop()
+        preview?.hide()
+    }
 }
 
 /// Everything a running recording owns. It lives only inside `Activity.recording`,
@@ -43,25 +69,13 @@ private enum CountdownOutcome {
     var remaining: Int
     let output: Output
     /// Screen rectangle about to be recorded; the big number is drawn over it.
-    let area: CGRect
+    let area: ScreenRect
 }
 
-/// ⌘⇧., the shortcut that records, cancels and finishes from any app. Carbon can
-/// refuse the registration; the surfaces that name the key then stop advertising it.
-enum HotkeyRegistration {
-    case pending
-    case active(GlobalHotkey)
-    case refused
-
-    static let keys = "⌘⇧."
-
-    /// The keys to advertise, or nil when pressing them would do nothing.
-    var advertisedKeys: String? {
-        switch self {
-        case .pending, .active: return Self.keys
-        case .refused: return nil
-        }
-    }
+/// What the process does once a quit goes through.
+enum AfterQuit: Equatable {
+    case exit
+    case relaunch
 }
 
 /// What quitting now would cost.
@@ -69,15 +83,15 @@ private enum QuitRisk {
     case safe
     /// Capturing: quitting would throw the recording away.
     case losesRecording
-    /// Encoding, shrinking or compressing: quitting would cut a file off half-written,
-    /// or leave a replaced original in the Trash with its replacement lost.
+    /// Encoding or compressing: quitting would cut a file off half-written, or throw
+    /// away a compression that was asked for.
     case interruptsSave
 }
 
 /// A quit the app has accepted but not carried out, because a save is still running.
 private enum PendingQuit {
     case notRequested
-    case waitingForSave
+    case waitingForSave(then: AfterQuit)
 }
 
 /// What the coordinator is doing, together with the things that exist only while
@@ -117,18 +131,25 @@ private enum PendingQuit {
 }
 
 @MainActor @Observable
-final class Coordinator: FrameSink {
+final class Coordinator: FrameSink, HUDModel {
     /// The one source of truth for the recording flow. Only `enter(_:)` writes it.
     private var activity: Activity = .idle
     /// What every surface renders. Derived, so it cannot disagree with `activity`.
     var phase: Phase { activity.phase }
     /// Zero unless recording; `enter(_:)` resets it on the way out.
     private(set) var micLevel: Float = 0
+    /// The one compression under way, whether the size limit or the Recordings pane
+    /// asked for it. Only `run(_:info:)` writes it.
     private(set) var compression: CompressionJob?
     private(set) var permissions: PermissionReport
-    private(set) var hotkey: HotkeyRegistration = .pending
+    private(set) var gifski: GifskiAvailability
+    /// ⌘⇧., the shortcut that records, cancels and finishes from any app.
+    private(set) var hotkey = AdvertisedHotkey(keys: "⌘⇧.", registration: .pending)
     /// Pane the settings window opens on; the menu sets it before opening the window.
     var settingsSection: SettingsSection = .capture
+    /// What the process does once a quit goes through. The app delegate reads it on
+    /// the way out.
+    private(set) var afterQuit: AfterQuit = .exit
 
     let settings: Settings
     let library: RecordingsStore
@@ -140,26 +161,31 @@ final class Coordinator: FrameSink {
     @ObservationIgnored private let grantPanel = GrantPanel()
     @ObservationIgnored private let permissionsAtLaunch: PermissionReport
     @ObservationIgnored private var pendingQuit = PendingQuit.notRequested
+    /// Set by `quit(then:)` just before it asks AppKit to terminate and consumed by
+    /// the terminate reply, so a ⌘Q from anywhere else is a plain exit.
+    @ObservationIgnored private var requestedAfterQuit: AfterQuit = .exit
 
     init() {
         permissionsAtLaunch = Permissions.check()
         permissions = permissionsAtLaunch
+        gifski = GifskiAvailability.locate()
         settings = Settings()
-        library = RecordingsStore(folder: settings.saveFolder)
+        library = RecordingsStore()
         updater = Updater()
     }
 
     func start() {
         hud.attach(self)
-        if let registered = GlobalHotkey(keyCode: kVK_ANSI_Period, modifiers: cmdKey | shiftKey, { [weak self] in self?.hotkeyPressed() }) {
-            hotkey = .active(registered)
-        } else {
-            hotkey = .refused
-            FileHandle.standardError.write(Data("[Screensnap] start: could not register \(HotkeyRegistration.keys)\n".utf8))
+        hotkey.registration = .register(keyCode: kVK_ANSI_Period, modifiers: cmdKey | shiftKey) { [weak self] in self?.hotkeyPressed() }
+        if case .refused = hotkey.registration {
+            FileHandle.standardError.write(Data("[Screensnap] start: could not register \(hotkey.keys)\n".utf8))
         }
         updater.checkIfDue(settings: settings)
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshPermissions() }
+            Task { @MainActor [weak self] in
+                self?.refreshPermissions()
+                self?.refreshGifski()
+            }
         }
     }
 
@@ -167,9 +193,20 @@ final class Coordinator: FrameSink {
         permissions = Permissions.check()
     }
 
+    /// gifski can be installed or removed while the app runs; the Output pane and
+    /// the next recording both read the answer from here.
+    func refreshGifski() {
+        gifski = GifskiAvailability.locate()
+    }
+
     var screenRecordingAccess: ScreenRecordingAccess {
         permissions.screenRecordingAccess(since: permissionsAtLaunch)
     }
+
+    var finishKeys: String? { hotkey.advertisedKeys }
+
+    /// The keys that tuck the pill, while there is a pill to tuck.
+    var controlsKeys: String? { hud.chrome.presenceKeys }
 
     /// Opens the pane with the drag tile beside it. No `requestScreenRecording()`
     /// here: its dialog would stack on top of the pane we're already opening.
@@ -177,8 +214,8 @@ final class Coordinator: FrameSink {
     /// ideally before System Settings gets to ask "Quit & Reopen?".
     func grantScreenRecording() {
         Permissions.openSettings(.screenRecording)
-        grantPanel.show(isGranted: { CGPreflightScreenCaptureAccess() }) {
-            Relaunch.now(after: .zero)
+        grantPanel.show(isGranted: { CGPreflightScreenCaptureAccess() }) { [weak self] in
+            self?.quit(then: .relaunch, after: .zero)
         }
     }
 
@@ -190,30 +227,58 @@ final class Coordinator: FrameSink {
         Task { _ = await Permissions.ensureMicrophoneAccess(); refreshPermissions() }
     }
 
+    func installUpdate() {
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await self.updater.install()
+            if case .installed = outcome { self.relaunch() }
+        }
+    }
+
     // MARK: Quitting
+
+    /// Quits, then opens a fresh copy. The copy is launched only once the quit is
+    /// accepted: a quit can be held up by a recording or a save, or cancelled, and
+    /// two instances must never run side by side.
+    func relaunch() {
+        quit(then: .relaunch)
+    }
+
+    /// The default delay lets the menu or button that asked finish closing.
+    private func quit(then outcome: AfterQuit, after delay: Duration = .milliseconds(400)) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self else { return }
+            self.requestedAfterQuit = outcome
+            NSApp.terminate(nil)
+        }
+    }
 
     /// The app delegate's answer to ⌘Q. A recording in progress is finished or
     /// discarded first, as the user chooses; a save in progress is waited for.
     /// `enter(_:)` releases the quit once nothing is left to lose.
     func handleQuitRequest() -> NSApplication.TerminateReply {
+        let outcome = requestedAfterQuit
+        requestedAfterQuit = .exit
         // The first quit is still waiting; a second must not open a nested wait
         // that the single reply cannot end.
         if case .waitingForSave = pendingQuit { return .terminateCancel }
         switch quitRisk {
         case .safe:
+            afterQuit = outcome
             return .terminateNow
         case .interruptsSave:
-            pendingQuit = .waitingForSave
+            pendingQuit = .waitingForSave(then: outcome)
             return .terminateLater
         case .losesRecording:
-            guard let reason = askHowToEndRecording() else {
-                Relaunch.cancel()
-                return .terminateCancel
-            }
+            guard let reason = askHowToEndRecording() else { return .terminateCancel }
             // The alert ran a modal loop, and ⌘⇧. or a failure may have ended the
             // recording meanwhile.
-            guard case .recording = activity else { return handleQuitRequest() }
-            pendingQuit = .waitingForSave
+            guard case .recording = activity else {
+                requestedAfterQuit = outcome
+                return handleQuitRequest()
+            }
+            pendingQuit = .waitingForSave(then: outcome)
             Task { await stop(reason) }
             return .terminateLater
         }
@@ -230,13 +295,13 @@ final class Coordinator: FrameSink {
 
     /// Called whenever something that can hold up a quit ends.
     private func releasePendingQuitIfSafe() {
-        guard case .waitingForSave = pendingQuit, case .safe = quitRisk else { return }
+        guard case .waitingForSave(let outcome) = pendingQuit, case .safe = quitRisk else { return }
         pendingQuit = .notRequested
         // A save that failed cancels the quit, so its message stays on screen.
         if case .settled(.failed, _) = activity {
-            Relaunch.cancel()
             NSApp.reply(toApplicationShouldTerminate: false)
         } else {
+            afterQuit = outcome
             NSApp.reply(toApplicationShouldTerminate: true)
         }
     }
@@ -274,13 +339,14 @@ final class Coordinator: FrameSink {
         guard !phase.isBusy else { return }
         settings.captureMode = mode
         refreshPermissions()
+        refreshGifski()
         switch screenRecordingAccess {
         case .missing:
             Permissions.requestScreenRecording()
             settle(.failed("Screen Recording is off — turn Screensnap on in System Settings, then record again"))
             return
         case .grantedSinceLaunch:
-            Relaunch.now()
+            relaunch()
             return
         case .granted:
             break
@@ -296,13 +362,22 @@ final class Coordinator: FrameSink {
                     await self.begin(source: .region(region))
                 }
             }
-        case .display, .window:
-            enter(.choosingSource(mode))
-            Task { [weak self] in
-                let source = await SourcePicker.choose(mode)
-                guard let self, case .choosingSource = self.activity else { return }
-                guard let source else { self.enter(.idle); return }
-                await self.begin(source: source)
+        case .display:
+            pick(.display)
+        case .window:
+            pick(.window)
+        }
+    }
+
+    private func pick(_ kind: PickableKind) {
+        enter(.choosingSource(kind.captureMode))
+        Task { [weak self] in
+            let choice = await SourcePicker.choose(kind)
+            guard let self, case .choosingSource = self.activity else { return }
+            switch choice {
+            case .picked(let source): await self.begin(source: source)
+            case .cancelled: self.enter(.idle)
+            case .unavailable(let error): self.settle(.failed("Could not list what is on screen — \(error.localizedDescription)"))
             }
         }
     }
@@ -321,17 +396,18 @@ final class Coordinator: FrameSink {
     }
 
     /// Frames and audio stop reaching the file; the finished recording has no gap.
+    /// The pill's clock is fed from the recorder's, so the two cannot drift apart.
     func togglePause() {
         guard case .recording(let session, var run) = activity else { return }
         switch run.clock {
         case .running:
-            session.recorder.pause()
+            let elapsed = session.recorder.pause()
             session.audio?.pause()
-            run.clock = run.clock.pausing(at: Date())
-        case .paused:
+            run.clock = .paused(total: elapsed)
+        case .paused(let total):
             let pausedFor = session.recorder.resume()
             session.audio?.resume(pausedFor: pausedFor)
-            run.clock = run.clock.resuming(at: Date())
+            run.clock = .running(since: Date(), before: total)
         }
         enter(.recording(session, run))
     }
@@ -353,17 +429,20 @@ final class Coordinator: FrameSink {
     }
 
     private func begin(source: CaptureSource) async {
-        let (output, fallback) = Self.effective(settings.output)
-        enter(.starting(output))
-        var degradations: [Degradation] = fallback.map { [$0] } ?? []
+        guard let geometry = source.resolveGeometry() else {
+            settle(.failed("The display to record is no longer connected"))
+            return
+        }
+        var (encoder, degradations) = Self.plan(settings.output, gifski: gifski)
+        enter(.starting(encoder.output))
+        var setup = SessionSetup()
 
-        var camera: CameraCapture?
         if settings.facecam == .bubble {
             if await Permissions.ensureCameraAccess() {
                 let capture = CameraCapture()
                 do {
                     try capture.start()
-                    camera = capture
+                    setup.camera = capture
                 } catch {
                     degradations.append(.camera(error.localizedDescription))
                 }
@@ -372,90 +451,102 @@ final class Coordinator: FrameSink {
             }
         }
 
-        var microphoneGranted = false
-        if output.recordsMicrophone {
-            microphoneGranted = await Permissions.ensureMicrophoneAccess()
-            if !microphoneGranted { degradations.append(.microphone("microphone access denied")) }
+        // The microphone comes up before the encoder is made, so a microphone that
+        // cannot deliver takes the voice track out of the plan instead of leaving an
+        // empty one in the file with a chip that says "voice".
+        if case .mp4(.microphone) = encoder {
+            if await Permissions.ensureMicrophoneAccess() {
+                let capture = MicrophoneCapture { [weak self] level in
+                    Task { @MainActor [weak self] in self?.showMicLevel(level) }
+                }
+                do {
+                    try capture.start()
+                    setup.microphone = capture
+                } catch {
+                    encoder = .mp4(.none)
+                    degradations.append(.microphone(error.localizedDescription))
+                }
+            } else {
+                encoder = .mp4(.none)
+                degradations.append(.microphone("microphone access denied"))
+            }
+            enter(.starting(encoder.output))
         }
 
         // Up before the countdown, like a selfie timer: the delay is the time to frame
         // yourself and drag the bubble where it should sit.
-        let preview = camera.map { FacecamPreviewWindow(session: $0.session, captureFrame: source.screenFrame) }
-        preview?.show()
+        let placement = FacecamPlacementSource()
+        if let camera = setup.camera {
+            let preview = FacecamPreviewWindow(session: camera.session, captureFrame: geometry.screenFrame, placement: placement)
+            preview.show()
+            setup.preview = preview
+        }
 
         if settings.startDelay.seconds > 0 {
-            switch await countdown(seconds: settings.startDelay.seconds, output: output, over: source.screenFrame) {
+            switch await countdown(seconds: settings.startDelay.seconds, output: encoder.output, over: geometry.screenFrame) {
             case .cancelled:
-                camera?.stop()
-                preview?.hide()
+                setup.abandon()
                 enter(.idle)
                 return
             case .completed:
-                enter(.starting(output))
+                enter(.starting(encoder.output))
             }
         }
 
-        try? FileManager.default.createDirectory(at: settings.saveFolder, withIntermediateDirectories: true)
-        let url = settings.newRecordingURL(for: output)
+        let url = library.newRecordingURL(template: settings.filenameTemplate, output: encoder.output)
+        let framerate = settings.framerate(for: encoder.output.container)
         let encoderSetup: EncoderSetup
         do {
-            encoderSetup = try EncoderSetup.make(
-                output: output, url: url, framerate: settings.framerate(for: output.container).fps,
-                pixelSize: source.pixelSize, audio: microphoneGranted ? .microphone : .none
-            )
+            encoderSetup = try EncoderSetup.make(encoder, url: url, framerate: framerate, pixelSize: geometry.pixelSize)
         } catch {
-            camera?.stop()
-            preview?.hide()
+            setup.abandon()
             settle(.failed(error.localizedDescription))
             return
         }
-
-        var microphone: MicrophoneCapture?
+        setup.encoder = encoderSetup
         if let channel = encoderSetup.audioChannel {
-            let capture = MicrophoneCapture(
-                onSampleBuffer: { channel.append($0) },
-                onLevel: { [weak self] level in Task { @MainActor [weak self] in self?.showMicLevel(level) } }
-            )
-            do {
-                try capture.start()
-                microphone = capture
-            } catch {
-                degradations.append(.microphone(error.localizedDescription))
-            }
+            setup.microphone?.deliver(to: { channel.append($0) })
         }
 
+        let overlay = setup.camera.map { FacecamOverlay(camera: $0, placement: placement) }
         let recorder = ScreenRecorder(
             source: source,
-            framerate: settings.framerate(for: output.container),
+            geometry: geometry,
+            framerate: framerate,
             captureCursor: settings.captureCursor,
-            excludeWindowIDs: [hud.windowID, preview?.windowID].compactMap { $0 },
+            excludeWindowIDs: [hud.windowID, setup.preview?.windowID].compactMap { $0 },
+            overlay: overlay,
             sink: self
         )
         do {
             try await recorder.start()
         } catch {
-            microphone?.stop()
-            camera?.stop()
-            preview?.hide()
-            encoderSetup.encoder.cancel()
+            setup.abandon()
             settle(.failed(error.localizedDescription))
             return
         }
 
         enter(.recording(
-            RecordingSession(source: source, recorder: recorder, encoder: encoderSetup.encoder, audio: encoderSetup.audioChannel, camera: camera, microphone: microphone, preview: preview),
-            RecordingRun(clock: .started(at: Date()), output: output, degradations: degradations)
+            RecordingSession(
+                source: source, recorder: recorder, encoder: encoderSetup.encoder, audio: encoderSetup.audioChannel,
+                camera: setup.camera, microphone: setup.microphone, preview: setup.preview
+            ),
+            RecordingRun(clock: .started(at: Date()), output: encoder.output, degradations: degradations)
         ))
     }
 
     /// "GIF · best" needs gifski. Decided here, before a single frame is captured,
     /// so a missing binary costs a quality step rather than the recording.
-    private static func effective(_ output: Output) -> (Output, Degradation?) {
-        guard output == .gif(.best), GifskiEncoder.locateGifski() == nil else { return (output, nil) }
-        return (.gif(.fast), .gifskiMissing)
+    private static func plan(_ output: Output, gifski: GifskiAvailability) -> (EncoderChoice, [Degradation]) {
+        switch (output, gifski) {
+        case (.gif(.fast), _): return (.imageIOGif, [])
+        case (.gif(.best), .located(let url)): return (.gifski(url), [])
+        case (.gif(.best), .missing): return (.imageIOGif, [.gifskiMissing])
+        case (.mp4(let audio), _): return (.mp4(audio), [])
+        }
     }
 
-    private func countdown(seconds: Int, output: Output, over area: CGRect) async -> CountdownOutcome {
+    private func countdown(seconds: Int, output: Output, over area: ScreenRect) async -> CountdownOutcome {
         let task = Task<CountdownOutcome, Never> { [weak self] in
             for remaining in stride(from: seconds - 1, through: 0, by: -1) {
                 do { try await Task.sleep(for: .seconds(1)) } catch { return .cancelled }
@@ -487,66 +578,72 @@ final class Coordinator: FrameSink {
             // time a pending quit is released. The sink ignores frames that arrive after.
             session.encoder.cancel()
             settle(.discarded)
-            await session.recorder.stop()
+            _ = await session.recorder.stop()
             session.stopDevices()
         case .restart:
             session.encoder.cancel()
             enter(.starting(run.output))
-            await session.recorder.stop()
+            _ = await session.recorder.stop()
             session.stopDevices()
             await begin(source: session.source)
         case .finish:
             enter(.finishing(.encoding(run.output)))
-            await session.recorder.stop()
+            let end = await session.recorder.stop()
             session.stopDevices()
             do {
-                let encoded = try await session.encoder.finish()
-                let url = encoded.url
-                var notes = (run.degradations + [encoded.degradation].compactMap { $0 }).map(\.message)
+                let encoded = try await session.encoder.finish(at: end)
                 library.rescan()
-                guard var recording = library.recording(at: url) ?? Recording(url: url) else {
+                guard var recording = library.recording(at: encoded.url) ?? Recording(url: encoded.url) else {
                     throw CompressionError.unreadable
                 }
+                var fit: FitOutcome?
                 if case .atMost(let ceiling) = settings.sizeLimit, recording.bytes > ceiling.size {
-                    recording = try await fit(recording, under: ceiling.size)
-                    notes.append(recording.bytes <= ceiling.size ? "shrunk to fit \(ceiling.size.formatted)" : "could not get under \(ceiling.size.formatted)")
+                    let fitted = try await self.fit(recording, under: ceiling.size)
+                    recording = fitted.recording
+                    fit = fitted.outcome
                 }
-                deliver(recording)
-                settle(.saved(recording, notes: notes))
+                let delivered = deliver(recording)
+                settle(.saved(SavedRecording(
+                    recording: recording,
+                    degradations: run.degradations + [encoded.degradation].compactMap { $0 },
+                    fit: fit,
+                    delivered: delivered
+                )))
             } catch {
                 settle(.failed(error.localizedDescription))
             }
         }
     }
 
-    private func fit(_ recording: Recording, under limit: ByteCount) async throws -> Recording {
-        enter(.finishing(.fittingToLimit(limit, progress: 0)))
-        guard let info = await MediaInfo.load(recording) else { throw CompressionError.unreadable }
-        let result = try await Compressor.compress(recording, info: info, to: .size(limit), placement: .replaceOriginal) { [weak self] progress in
-            Task { @MainActor [weak self] in self?.showFitProgress(progress) }
-        }
-        library.rescan()
+    /// Shrinks a fresh recording under the limit through the same job slot the
+    /// Recordings pane uses. A slot already taken leaves the recording as it is and
+    /// says so, rather than running two compressions at once.
+    private func fit(_ recording: Recording, under limit: ByteCount) async throws -> (recording: Recording, outcome: FitOutcome) {
+        guard compression == nil else { return (recording, .skipped(limit)) }
+        enter(.finishing(.fittingToLimit(limit)))
+        guard let info = await library.loadInfo(for: recording) else { throw CompressionError.unreadable }
+        let job = CompressionJob(recording: recording, target: .size(limit), placement: .replaceOriginal, origin: .sizeLimit, progress: 0)
+        let result = try await run(job, info: info)
         guard let fitted = library.recording(at: result.url) ?? Recording(url: result.url) else { throw CompressionError.unreadable }
-        return fitted
+        switch result.fit {
+        case .met: return (fitted, .shrunk(under: limit))
+        case .exceeded: return (fitted, .stillOver(limit))
+        }
     }
 
-    /// Progress arrives on its own tasks and can land after the fit is over. It only
-    /// ever moves the bar of a fit that is still showing, never reopens one.
-    private func showFitProgress(_ progress: Double) {
-        guard case .finishing(.fittingToLimit(let limit, _)) = activity else { return }
-        enter(.finishing(.fittingToLimit(limit, progress: progress)))
-    }
-
-    private func deliver(_ recording: Recording) {
-        if settings.delivery.clipboard.applies(to: OutputContainer(url: recording.url)) { Clipboard.copy(recording.url) }
-        if settings.delivery.revealInFinder { library.reveal(recording) }
+    private func deliver(_ recording: Recording) -> Delivered {
+        let copy = settings.delivery.clipboard.applies(to: recording.container)
+        if copy { Clipboard.copy(recording) }
+        let reveal = settings.delivery.revealInFinder
+        if reveal { library.reveal(recording) }
+        return Delivered(copiedToClipboard: copy, revealedInFinder: reveal)
     }
 
     private func abort(_ error: Error) async {
         guard case .recording(let session, _) = activity else { return }
         session.encoder.cancel()
         settle(.failed(error.localizedDescription))
-        await session.recorder.stop()
+        _ = await session.recorder.stop()
         session.stopDevices()
     }
 
@@ -588,14 +685,12 @@ final class Coordinator: FrameSink {
 
     // MARK: FrameSink
 
+    /// The frame arrives with the facecam already drawn in on the capture queue; all
+    /// that is left is to hand it to the encoder of the recording it belongs to.
     func sinkDidCapture(frame: CapturedFrame) {
         guard case .recording(let session, _) = activity else { return }
-        var image = frame.image
-        if let camera = session.camera, let preview = session.preview, let face = camera.latestFrame {
-            image = FacecamCompositor.composite(screen: image, camera: face, placement: preview.placement) ?? image
-        }
         do {
-            try session.encoder.append(CapturedFrame(image: image, timestamp: frame.timestamp, hostTime: frame.hostTime))
+            try session.encoder.append(frame)
         } catch {
             Task { await abort(error) }
         }
@@ -611,42 +706,47 @@ final class Coordinator: FrameSink {
 
     func copyLast() {
         guard let last = lastRecording else { return }
-        Clipboard.copy(last.url)
+        Clipboard.copy(last)
+    }
+
+    func reveal(_ recording: Recording) {
+        library.reveal(recording)
     }
 
     func setSaveFolder(_ url: URL) {
-        settings.saveFolder = url
         library.setFolder(url)
     }
 
     func compress(_ recording: Recording, to target: CompressionTarget, placement: CompressionPlacement) async -> CompressionOutcome {
-        guard compression == nil else { return .failed("Another compression is still running.") }
-        let loaded: MediaInfo?
-        if let cached = library.info(for: recording) {
-            loaded = cached
-        } else {
-            loaded = await MediaInfo.load(recording)
-        }
-        guard let info = loaded else {
+        guard compression == nil else { return .failed(CompressionError.busy.localizedDescription) }
+        guard let info = await library.loadInfo(for: recording) else {
             return .failed(CompressionError.unreadable.localizedDescription)
         }
-        compression = CompressionJob(recording: recording, target: target, progress: 0)
+        do {
+            let job = CompressionJob(recording: recording, target: target, placement: placement, origin: .manual, progress: 0)
+            return .done(try await run(job, info: info))
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    /// The one way a compression runs. Claims the single job slot for its duration,
+    /// so two compressions, whoever asked for them, never run at once.
+    private func run(_ job: CompressionJob, info: MediaInfo) async throws -> CompressionResult {
+        guard compression == nil else { throw CompressionError.busy }
+        compression = job
         defer {
             compression = nil
             releasePendingQuitIfSafe()
         }
-        do {
-            let result = try await Compressor.compress(recording, info: info, to: target, placement: placement) { [weak self] progress in
-                Task { @MainActor [weak self] in
-                    // A late update from a finished job must not move another job's bar.
-                    guard self?.compression?.recording == recording else { return }
-                    self?.compression?.progress = progress
-                }
+        let result = try await Compressor.compress(job.recording, info: info, to: job.target, placement: job.placement) { [weak self] progress in
+            Task { @MainActor [weak self] in
+                // A late update from a finished job must not move another job's bar.
+                guard self?.compression?.recording == job.recording else { return }
+                self?.compression?.progress = progress
             }
-            library.rescan()
-            return .done(result)
-        } catch {
-            return .failed(error.localizedDescription)
         }
+        library.rescan()
+        return result
     }
 }

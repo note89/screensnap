@@ -96,7 +96,6 @@ final class Settings {
         /// Legacy on/off switch, read once to seed `clipboardCopy`.
         static let copyToClipboard = "interface.copyToClipboard"
         static let clipboardCopy = "interface.clipboardCopy"
-        static let saveFolder = "persist.saveFolder"
         static let filenameFormat = "interface.filenameFormat"
         static let lastUpdateCheck = "updates.lastCheck"
     }
@@ -135,7 +134,6 @@ final class Settings {
         }
     }
     var filenameTemplate: FilenameTemplate { didSet { defaults.set(filenameTemplate.text, forKey: Key.filenameFormat) } }
-    var saveFolder: URL { didSet { defaults.set(saveFolder.path, forKey: Key.saveFolder) } }
     var lastUpdateCheck: Date? { didSet { defaults.set(lastUpdateCheck, forKey: Key.lastUpdateCheck) } }
 
     var output: Output {
@@ -168,29 +166,7 @@ final class Settings {
             revealInFinder: defaults.bool(forKey: Key.revealInFinder)
         )
         filenameTemplate = FilenameTemplate.parseOrStandard(defaults.string(forKey: Key.filenameFormat))
-        saveFolder = Self.resolveSaveFolder(stored: defaults.string(forKey: Key.saveFolder))
         lastUpdateCheck = defaults.object(forKey: Key.lastUpdateCheck) as? Date
-    }
-
-    static let defaultSaveFolder = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first!
-        .appendingPathComponent("Screensnap", isDirectory: true)
-
-    /// Earlier builds saved into ~/Documents/gif-recordings with no setting written.
-    /// If that folder still holds recordings, keep using it rather than orphaning them.
-    private static let legacySaveFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        .appendingPathComponent("gif-recordings", isDirectory: true)
-
-    private static func resolveSaveFolder(stored: String?) -> URL {
-        if let stored, !stored.isEmpty { return URL(fileURLWithPath: stored, isDirectory: true) }
-        let legacyHasRecordings = ((try? FileManager.default.contentsOfDirectory(atPath: legacySaveFolder.path)) ?? [])
-            .contains { ["gif", "mp4"].contains(($0 as NSString).pathExtension.lowercased()) }
-        return legacyHasRecordings ? legacySaveFolder : defaultSaveFolder
-    }
-
-    /// Where a recording started now gets saved: named by `filenameTemplate` (the
-    /// standard one yields `2026-05-17T14-30-00.gif`) and never an existing file.
-    func newRecordingURL(for output: Output, at date: Date = Date()) -> URL {
-        FileManager.default.unusedURL(in: saveFolder, stem: filenameTemplate.stem(at: date), pathExtension: output.fileExtension)
     }
 }
 

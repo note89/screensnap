@@ -5,7 +5,8 @@ import CoreVideo
 import os
 import ScreenCaptureKit
 
-/// One captured frame plus the time (in seconds since recording start) it was sampled.
+/// One captured frame plus the time (in seconds since recording start, pauses
+/// excluded) it was sampled.
 struct CapturedFrame {
     let image: CGImage
     let timestamp: CFTimeInterval
@@ -18,62 +19,46 @@ struct CapturedFrame {
 /// What to capture. Each case maps to a different `SCContentFilter` constructor.
 enum CaptureSource {
     /// A rectangular region on a specific display.
-    case region(SelectedRegion)
+    case region(DisplayPixelRect)
     /// An entire display.
     case display(SCDisplay)
     /// A single window — works even when the window is in a different Space.
     case window(SCWindow)
 
-    /// Output dimensions in whole pixels (accounting for the backing scale on
-    /// Retina displays). The region case already carries pixel-space rects;
-    /// the others are in points and need to be scaled here. The stream, the
-    /// encoder and the HUD all read this one value.
-    var pixelSize: CGSize {
-        let size: CGSize
+    /// The source measured against the displays present now, or nil when its
+    /// display is gone. A window belongs to the display showing most of it.
+    func resolveGeometry() -> CaptureGeometry? {
         switch self {
-        case .region(let r):
-            size = r.pixelRect.size
-        case .display(let d):
-            let scale = screen?.backingScaleFactor ?? 2
-            size = CGSize(width: CGFloat(d.width) * scale, height: CGFloat(d.height) * scale)
-        case .window(let w):
-            let scale = screen?.backingScaleFactor ?? 2
-            size = CGSize(width: w.frame.width * scale, height: w.frame.height * scale)
-        }
-        return CGSize(width: size.width.rounded(.down), height: size.height.rounded(.down))
-    }
-
-    /// The display the capture comes from. A window belongs to the one showing most
-    /// of it, compared in AppKit coordinates: `SCWindow.frame` is top-left origin and
-    /// `NSScreen.frame` bottom-left, and the two only agree on a single display.
-    var screen: NSScreen? {
-        switch self {
-        case .region(let r): return NSScreen.screen(displayID: r.displayID)
-        case .display(let d): return NSScreen.screen(displayID: d.displayID)
-        case .window: return NSScreen.screen(mostlyShowing: screenFrame)
+        case .region(let region):
+            guard let screen = NSScreen.screen(displayID: region.displayID) else { return nil }
+            return CaptureGeometry(pixelSize: region.pixelSize, screenFrame: region.screenRect(on: screen))
+        case .display(let display):
+            guard let screen = NSScreen.screen(displayID: display.displayID) else { return nil }
+            let points = CGSize(width: display.width, height: display.height)
+            return CaptureGeometry(pixelSize: Self.pixels(points, on: screen), screenFrame: ScreenRect(screen.frame))
+        case .window(let window):
+            let frame = ScreenRect(window: window)
+            guard let screen = NSScreen.screen(mostlyShowing: frame) else { return nil }
+            return CaptureGeometry(pixelSize: Self.pixels(frame.size, on: screen), screenFrame: frame)
         }
     }
 
-    /// Where the captured area sits on screen, in AppKit points (bottom-left origin).
-    /// The facecam preview compares its own frame against this to place the bubble.
-    var screenFrame: CGRect {
-        switch self {
-        case .region(let r):
-            guard let screen = NSScreen.screen(displayID: r.displayID) else { return .zero }
-            let scale = screen.backingScaleFactor
-            return CGRect(
-                x: screen.frame.minX + r.pixelRect.minX / scale,
-                y: screen.frame.maxY - r.pixelRect.maxY / scale,
-                width: r.pixelRect.width / scale,
-                height: r.pixelRect.height / scale
-            )
-        case .display(let d):
-            return NSScreen.screen(displayID: d.displayID)?.frame ?? .zero
-        case .window(let w):
-            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-            return CGRect(x: w.frame.minX, y: primaryHeight - w.frame.maxY, width: w.frame.width, height: w.frame.height)
-        }
+    /// Points to whole pixels at the screen's backing scale, rounded down so the
+    /// stream is never asked for a partial pixel.
+    private static func pixels(_ points: CGSize, on screen: NSScreen) -> Dimensions {
+        let scale = screen.backingScaleFactor
+        return Dimensions(width: Int((points.width * scale).rounded(.down)), height: Int((points.height * scale).rounded(.down)))
     }
+}
+
+/// A source measured against the displays present when recording starts. The
+/// stream, the encoder and the HUD read one pixel size; the facecam preview and the
+/// countdown are placed against one on-screen rectangle.
+struct CaptureGeometry: Equatable {
+    /// Output dimensions in whole pixels, backing scale applied.
+    let pixelSize: Dimensions
+    /// Where the captured area sits on screen.
+    let screenFrame: ScreenRect
 }
 
 @MainActor
@@ -94,15 +79,17 @@ enum StopReason {
     case restart
 }
 
-/// Wraps `SCStream`. Owns the recording lifecycle and
-/// throttles the irregular SCK frame stream onto a stable output framerate
-/// before forwarding frames to the sink.
+/// Wraps `SCStream`. Owns the recording lifecycle and its clock, throttles the
+/// irregular SCK frame stream onto a stable output framerate, draws the facecam
+/// overlay on the capture queue, and forwards frames to the sink.
 @MainActor
 final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let source: CaptureSource
+    private let geometry: CaptureGeometry
     private let framerate: Framerate
     private let captureCursor: Bool
     private let excludeWindowIDs: [CGWindowID]
+    private let overlay: FacecamOverlay?
     private weak var sink: FrameSink?
 
     private enum CaptureState {
@@ -113,28 +100,43 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var captureState: CaptureState = .idle
     private let frameQueue = DispatchQueue(label: "Screensnap.frameQueue")
 
-    /// Frame pacing, shared with the capture queue. While `.stopped` or `.paused` every
-    /// frame is dropped; while `.running` at most one per frame interval passes. One
-    /// value, so "capturing but no start time" cannot be represented. Resuming moves
-    /// `startedAt` forward by the pause, so frame timestamps have no gap in them.
+    /// The recording's clock, shared with the capture queue. While `.stopped` or
+    /// `.paused` every frame is dropped; while `.running` at most one per frame
+    /// interval passes. One value, so "capturing but no start time" cannot be
+    /// represented. Resuming moves `startedAt` forward by the pause, so frame
+    /// timestamps have no gap in them. Everything else that needs recorded time,
+    /// the pill, the audio track, the end of the file, reads it from here.
     private enum FrameClock {
         case stopped
         case running(startedAt: CFTimeInterval, lastEmitted: CFTimeInterval?)
         case paused(startedAt: CFTimeInterval, lastEmitted: CFTimeInterval?, since: CFTimeInterval)
+
+        /// Recorded seconds so far, pauses excluded.
+        func elapsed(at now: CFTimeInterval) -> CFTimeInterval {
+            switch self {
+            case .stopped: return 0
+            case .running(let startedAt, _): return now - startedAt
+            case .paused(let startedAt, _, let since): return since - startedAt
+            }
+        }
     }
     private let clock = OSAllocatedUnfairLock(initialState: FrameClock.stopped)
 
     init(
         source: CaptureSource,
+        geometry: CaptureGeometry,
         framerate: Framerate,
         captureCursor: Bool,
         excludeWindowIDs: [CGWindowID] = [],
+        overlay: FacecamOverlay?,
         sink: FrameSink
     ) {
         self.source = source
+        self.geometry = geometry
         self.framerate = framerate
         self.captureCursor = captureCursor
         self.excludeWindowIDs = excludeWindowIDs
+        self.overlay = overlay
         self.sink = sink
     }
 
@@ -149,8 +151,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         // to keep encoder timestamps regular.
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(framerate.fps))
         config.colorSpaceName = CGColorSpace.sRGB
-        config.width = Int(source.pixelSize.width)
-        config.height = Int(source.pixelSize.height)
+        config.width = geometry.pixelSize.width
+        config.height = geometry.pixelSize.height
 
         let filter: SCContentFilter
         switch source {
@@ -159,7 +161,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let display = content.displays.first(where: { $0.displayID == region.displayID }) else {
                 throw ScreenRecorderError.displayNotFound
             }
-            config.sourceRect = region.pixelRect
+            config.sourceRect = region.rect
             filter = Self.displayFilter(display: display, content: content, excludeWindowIDs: excludeWindowIDs)
 
         case .display(let display):
@@ -193,16 +195,19 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         return SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
     }
 
-    func pause() {
-        clock.withLock { state in
-            guard case .running(let startedAt, let lastEmitted) = state else { return }
-            state = .paused(startedAt: startedAt, lastEmitted: lastEmitted, since: CACurrentMediaTime())
+    /// Returns the recorded time so far, which the pill freezes on.
+    func pause() -> CFTimeInterval {
+        clock.withLock { (state: inout FrameClock) -> CFTimeInterval in
+            let now = CACurrentMediaTime()
+            guard case .running(let startedAt, let lastEmitted) = state else { return state.elapsed(at: now) }
+            state = .paused(startedAt: startedAt, lastEmitted: lastEmitted, since: now)
+            return now - startedAt
         }
     }
 
     /// Returns how long the recording was paused, so audio can be shifted to match.
     func resume() -> CFTimeInterval {
-        clock.withLock { state in
+        clock.withLock { (state: inout FrameClock) -> CFTimeInterval in
             guard case .paused(let startedAt, let lastEmitted, let since) = state else { return 0 }
             let pausedFor = CACurrentMediaTime() - since
             state = .running(startedAt: startedAt + pausedFor, lastEmitted: lastEmitted)
@@ -210,11 +215,18 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    func stop() async {
-        guard case .capturing(let stream) = captureState else { return }
+    /// Returns the recording's length on its clock, pauses excluded: the moment the
+    /// encoder cuts the file at.
+    func stop() async -> CFTimeInterval {
+        let end = clock.withLock { (state: inout FrameClock) -> CFTimeInterval in
+            let end = state.elapsed(at: CACurrentMediaTime())
+            state = .stopped
+            return end
+        }
+        guard case .capturing(let stream) = captureState else { return end }
         self.captureState = .stopped
-        clock.withLock { $0 = .stopped }
         try? await stream.stopCapture()
+        return end
     }
 
     // MARK: - SCStreamOutput
@@ -242,8 +254,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         guard let tick else { return }
 
-        guard let cgImage = sampleBuffer.cgImage() else { return }
-        let frame = CapturedFrame(image: cgImage, timestamp: tick.elapsed, hostTime: tick.hostTime)
+        guard let captured = sampleBuffer.cgImage() else { return }
+        let image = overlay?.apply(to: captured) ?? captured
+        let frame = CapturedFrame(image: image, timestamp: tick.elapsed, hostTime: tick.hostTime)
         Task { @MainActor [weak self] in
             self?.sink?.sinkDidCapture(frame: frame)
         }

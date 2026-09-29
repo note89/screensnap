@@ -2,30 +2,6 @@ import Accelerate
 import CoreGraphics
 import Foundation
 
-struct PixelPoint: Equatable {
-    let x: Int
-    let y: Int
-
-    static let zero = PixelPoint(x: 0, y: 0)
-}
-
-/// A rectangle of whole pixels. The origin is the top-left corner, matching the
-/// order image rows are stored in and the way GIF places frames.
-struct PixelRect: Equatable {
-    let origin: PixelPoint
-    let size: Dimensions
-
-    var cgRect: CGRect {
-        CGRect(x: origin.x, y: origin.y, width: size.width, height: size.height)
-    }
-}
-
-extension CGImage {
-    var pixelBounds: PixelRect {
-        PixelRect(origin: .zero, size: Dimensions(width: width, height: height))
-    }
-}
-
 /// What differs between a frame and the one before it.
 enum FrameChange: Equatable {
     case unchanged

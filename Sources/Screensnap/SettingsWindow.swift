@@ -87,7 +87,7 @@ private struct CapturePane: View {
 
     private var shortcutSubtitle: String {
         guard let keys = coordinator.hotkey.advertisedKeys else {
-            return "Pick what to record from the menu bar. \(HotkeyRegistration.keys) could not be registered, so start and finish from the menu bar too."
+            return "Pick what to record from the menu bar. \(coordinator.hotkey.keys) could not be registered, so start and finish from the menu bar too."
         }
         return "Pick what to record from the menu bar. \(keys) starts the last mode from anywhere, and finishes."
     }
@@ -221,7 +221,7 @@ struct PermissionsRows: View {
                 Text("Screen Recording")
                 Text("granted — relaunch to activate").font(.caption).foregroundStyle(.orange)
                 Spacer()
-                Button("Relaunch") { Relaunch.now() }.buttonStyle(.borderedProminent)
+                Button("Relaunch") { coordinator.relaunch() }.buttonStyle(.borderedProminent)
             }
         case .missing:
             HStack {
@@ -278,7 +278,10 @@ private struct OutputPane: View {
         self.settings = coordinator.settings
     }
 
-    private var gifskiInstalled: Bool { GifskiEncoder.locateGifski() != nil }
+    private var gifskiInstalled: Bool {
+        if case .located = coordinator.gifski { return true }
+        return false
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -353,6 +356,7 @@ private struct OutputPane: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         .onAppear {
+            coordinator.refreshGifski()
             if case .atMost(let ceiling) = settings.sizeLimit { customMB = String(ceiling.megabytes) }
         }
     }
@@ -547,7 +551,7 @@ private struct FilenameField: View {
             }
             switch FilenameTemplate.parse(draft) {
             case .success(let template):
-                Text("Next: \(template.stem(at: Date())).\(settings.output.fileExtension)")
+                Text("Next: \(template.stem(at: Date()).text).\(settings.output.fileExtension)")
                     .font(.caption).foregroundStyle(.secondary)
             case .failure(let error):
                 Text("\(error.message) Still using \(settings.filenameTemplate.text).")
@@ -580,6 +584,7 @@ private struct RecordingRow: View {
     @FocusState private var nameFieldFocused: Bool
 
     private var library: RecordingsStore { coordinator.library }
+    /// The compression on this file, whether the size limit or this row started it.
     private var job: CompressionJob? { coordinator.compression?.recording == recording ? coordinator.compression : nil }
 
     private static let timestamp: DateFormatter = {
@@ -637,7 +642,7 @@ private struct RecordingRow: View {
             Spacer()
             HStack(spacing: 7) {
                 iconButton("play.fill", help: "Play") { library.play(recording) }
-                iconButton("doc.on.doc", help: "Copy — ⌘V pastes it") { Clipboard.copy(recording.url) }
+                iconButton("doc.on.doc", help: "Copy — ⌘V pastes it") { Clipboard.copy(recording) }
                 iconButton("magnifyingglass", help: "Show in Finder") { library.reveal(recording) }
                 Button {
                     compressing = true
@@ -648,7 +653,7 @@ private struct RecordingRow: View {
                 .help("Make smaller…")
                 .disabled(coordinator.compression != nil)
                 .popover(isPresented: $compressing, arrowEdge: .bottom) {
-                    CompressPopover(recording: recording, info: library.info(for: recording)) { target, placement in
+                    CompressPopover(recording: recording, info: library.requestInfo(for: recording)) { target, placement in
                         compressing = false
                         Task { await run(target: target, placement: placement) }
                     }
@@ -663,7 +668,7 @@ private struct RecordingRow: View {
     private var thumbnail: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor))
-            if let image = library.thumbnail(for: recording) {
+            if let image = library.requestThumbnail(for: recording) {
                 Image(decorative: image, scale: 1).resizable().aspectRatio(contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: 5))
             } else {
@@ -684,7 +689,7 @@ private struct RecordingRow: View {
 
     private var meta: String {
         var parts = [recording.container.rawValue.uppercased()]
-        if let info = library.info(for: recording) {
+        if let info = library.requestInfo(for: recording) {
             parts.append(info.dimensions.label)
             parts.append(info.durationLabel)
         }
@@ -822,7 +827,7 @@ private struct AboutPane: View {
                 case .available(let release):
                     Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.accentColor)
                     Text("Version \(release.version.description) is available.")
-                    Button("Update and relaunch") { Task { await updater.install() } }
+                    Button("Update and relaunch") { coordinator.installUpdate() }
                         .buttonStyle(.borderedProminent)
                     Link("What's new", destination: release.pageURL)
                 case .downloading(let release, _):
@@ -847,7 +852,7 @@ private struct AboutPane: View {
 
             SectionLabel("LINKS")
             Link("Source and releases on GitHub", destination: updater.releasesPage)
-            Button("Relaunch Screensnap") { Relaunch.now() }
+            Button("Relaunch Screensnap") { coordinator.relaunch() }
         }
     }
 }

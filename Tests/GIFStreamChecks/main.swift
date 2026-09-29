@@ -1,6 +1,6 @@
-// Checks for GIFStream.swift and FrameDiff.swift. Run with Scripts/check-gif-stream.sh,
-// which compiles this file together with those sources. XCTest needs Xcode; this
-// needs only the Command Line Tools.
+// Checks for GIFStream.swift, FrameDiff.swift and FilenameTemplate.swift. Run with
+// Scripts/check-gif-stream.sh, which compiles this file together with those sources.
+// XCTest needs Xcode; this needs only the Command Line Tools.
 
 import CoreGraphics
 import Foundation
@@ -238,6 +238,39 @@ do {
         check(DecodedGIF(savedAt).frames.count == 1, "a failed move keeps the recording and says where")
         try? FileManager.default.removeItem(at: savedAt.deletingLastPathComponent())
     }
+}
+
+// MARK: - File names
+
+func stemError(_ text: String) -> FileStem.ParseError? {
+    if case .failure(let error) = FileStem.parse(text) { return error }
+    return nil
+}
+
+func templateError(_ text: String) -> FilenameTemplate.ParseError? {
+    if case .failure(let error) = FilenameTemplate.parse(text) { return error }
+    return nil
+}
+
+do {
+    check(stemError("clip") == nil, "a plain name is a stem")
+    check(stemError("  ") == .blank, "a blank name is refused")
+    check(stemError(".hidden") == .startsWithDot, "a leading dot is refused")
+    check(stemError("a/b") == .forbidden("/"), "a slash is refused")
+    check(stemError("a:b") == .forbidden(":"), "a colon is refused")
+
+    let noon = DateComponents(calendar: .current, year: 2026, month: 5, day: 17, hour: 14, minute: 30, second: 0).date!
+    switch FilenameTemplate.parse(FilenameTemplate.standardText) {
+    case .success(let template):
+        check(template.stem(at: noon).text == "2026-05-17T14-30-00", "the standard template renders", template.stem(at: noon).text)
+    case .failure(let error):
+        check(false, "the standard template parses", error.message)
+    }
+    check(FilenameTemplate.parse("take %%%d").map { $0.stem(at: noon).text } == .success("take %17"), "%% is a literal percent sign")
+    check(templateError("%Q") == .unknownField("Q"), "an unknown field is refused")
+    check(templateError("clip%") == .trailingPercent, "a trailing percent is refused")
+    check(templateError("a/%Y") == .stem(.forbidden("/")), "a template refuses what a stem refuses")
+    check(templateError(".%Y") == .stem(.startsWithDot), "a template starting with a dot is refused")
 }
 
 print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check(s) failed.")

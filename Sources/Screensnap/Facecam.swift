@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import CoreGraphics
+import os
 
 enum CaptureDeviceError: LocalizedError {
     case noCamera
@@ -58,6 +59,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     /// Most recent camera frame as a CGImage, or nil while the camera warms up.
+    /// Safe from any thread.
     var latestFrame: CGImage? {
         lock.lock()
         let buffer = latestBuffer
@@ -76,12 +78,38 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
 /// Where the bubble sits inside the recording, as fractions of the frame so the
 /// same value works in preview points and recording pixels. CG axes: y grows upward.
-struct FacecamPlacement: Equatable {
+struct FacecamPlacement: Equatable, Sendable {
     var center: CGPoint
     /// Fraction of the frame's short edge.
     var diameter: CGFloat
 
     static let bottomLeft = FacecamPlacement(center: CGPoint(x: 0.16, y: 0.16), diameter: 0.275)
+}
+
+/// The bubble's position, shared between the preview window that sets it on the
+/// main thread whenever it is moved and the frame pipeline that reads it on the
+/// capture queue for every frame.
+final class FacecamPlacementSource: Sendable {
+    private let lock = OSAllocatedUnfairLock(initialState: FacecamPlacement.bottomLeft)
+
+    var placement: FacecamPlacement {
+        get { lock.withLock { $0 } }
+        set { lock.withLock { $0 = newValue } }
+    }
+}
+
+/// Draws the facecam into each captured frame on the capture queue, before the frame
+/// reaches the main actor, so a full-frame draw never runs on the UI thread.
+/// `CameraCapture` keeps its latest frame behind a lock and `FacecamPlacementSource`
+/// its placement, which is what makes reading both from here safe.
+struct FacecamOverlay: @unchecked Sendable {
+    let camera: CameraCapture
+    let placement: FacecamPlacementSource
+
+    func apply(to screen: CGImage) -> CGImage {
+        guard let face = camera.latestFrame else { return screen }
+        return FacecamCompositor.composite(screen: screen, camera: face, placement: placement.placement) ?? screen
+    }
 }
 
 /// Draws the camera frame as a mirrored circular bubble onto a screen frame.
@@ -150,37 +178,43 @@ enum FacecamCompositor {
 }
 
 /// Floating circular self-view that is also the bubble's authoritative position:
-/// drag it anywhere inside the captured area and the recording follows. Excluded
-/// from screen capture — the bubble in the output comes from the compositor.
+/// drag it anywhere inside the captured area and the recording follows, through
+/// the `FacecamPlacementSource` it publishes to on every move. Excluded from
+/// screen capture — the bubble in the output comes from the compositor.
 @MainActor
 final class FacecamPreviewWindow {
     private let panel: NSPanel
-    private let captureFrame: CGRect
+    private let captureFrame: ScreenRect
+    private let source: FacecamPlacementSource
+    private var moveObserver: NSObjectProtocol?
 
     var windowID: CGWindowID? {
         let number = panel.windowNumber
         return number > 0 ? CGWindowID(number) : nil
     }
 
-    /// Read per frame by the compositor; derived from where the user left the panel.
+    /// Derived from where the user left the panel, against the captured area.
     var placement: FacecamPlacement {
-        guard captureFrame.width > 0, captureFrame.height > 0 else { return .bottomLeft }
+        let area = captureFrame.cgRect
+        guard area.width > 0, area.height > 0 else { return .bottomLeft }
         let frame = panel.frame
         return FacecamPlacement(
             center: CGPoint(
-                x: (frame.midX - captureFrame.minX) / captureFrame.width,
-                y: (frame.midY - captureFrame.minY) / captureFrame.height
+                x: (frame.midX - area.minX) / area.width,
+                y: (frame.midY - area.minY) / area.height
             ),
-            diameter: frame.width / min(captureFrame.width, captureFrame.height)
+            diameter: frame.width / min(area.width, area.height)
         )
     }
 
-    init(session: AVCaptureSession, captureFrame: CGRect) {
+    init(session: AVCaptureSession, captureFrame: ScreenRect, placement source: FacecamPlacementSource) {
         self.captureFrame = captureFrame
-        let shortEdge = min(captureFrame.width, captureFrame.height)
+        self.source = source
+        let area = captureFrame.cgRect
+        let shortEdge = min(area.width, area.height)
         let diameter = min(max(shortEdge * FacecamPlacement.bottomLeft.diameter, 60), 260)
         let margin = diameter * 0.15
-        let rect = CGRect(x: captureFrame.minX + margin, y: captureFrame.minY + margin, width: diameter, height: diameter)
+        let rect = CGRect(x: area.minX + margin, y: area.minY + margin, width: diameter, height: diameter)
         panel = NSPanel(
             contentRect: rect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -219,10 +253,27 @@ final class FacecamPreviewWindow {
         }
         view.layer?.addSublayer(preview)
         panel.contentView = view
+
+        moveObserver = NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.publishPlacement() }
+        }
+        publishPlacement()
     }
 
-    func show() { panel.orderFrontRegardless() }
-    func hide() { panel.orderOut(nil) }
+    func show() {
+        panel.orderFrontRegardless()
+        publishPlacement()
+    }
+
+    func hide() {
+        if let moveObserver { NotificationCenter.default.removeObserver(moveObserver) }
+        moveObserver = nil
+        panel.orderOut(nil)
+    }
+
+    private func publishPlacement() {
+        source.placement = placement
+    }
 }
 
 extension CGImage {

@@ -97,35 +97,11 @@ enum Permissions {
     }
 }
 
-/// Quits, then opens a fresh copy. The copy is launched only once the quit is
-/// accepted: a quit can be held up by a recording or a save, or cancelled, and two
-/// instances must never run side by side.
-@MainActor
+/// Opens a fresh copy of this bundle. Only from `applicationWillTerminate`, once the
+/// quit can no longer be cancelled, so two instances never run side by side. Whether
+/// a quit ends this way is the coordinator's decision (`AfterQuit`).
 enum Relaunch {
-    private enum Request {
-        case none
-        case afterQuit
-    }
-
-    private static var request = Request.none
-
-    /// The default delay lets the menu or HUD that triggered the relaunch finish closing.
-    static func now(after delay: Duration = .milliseconds(400)) {
-        Task { @MainActor in
-            try? await Task.sleep(for: delay)
-            request = .afterQuit
-            NSApp.terminate(nil)
-        }
-    }
-
-    /// The quit this relaunch rode on was cancelled.
-    static func cancel() {
-        request = .none
-    }
-
-    /// From `applicationWillTerminate`, when the quit can no longer be cancelled.
-    static func launchIfRequested() {
-        guard case .afterQuit = request else { return }
+    static func launchFreshCopy() {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         process.arguments = ["-n", Bundle.main.bundleURL.path]

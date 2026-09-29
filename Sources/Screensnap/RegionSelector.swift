@@ -2,27 +2,18 @@ import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 
-/// A region the user has selected on a particular display.
-struct SelectedRegion {
-    /// The display the region lives on.
-    let displayID: CGDirectDisplayID
-    /// The selection in *pixels*, top-left origin, relative to the display.
-    /// This is the format ScreenCaptureKit's `sourceRect` expects.
-    let pixelRect: CGRect
-}
-
 /// Drag-to-select region overlay, modeled after macOS Cmd+Shift+5.
 ///
 /// The selector covers every connected display with a dimmed overlay window.
-/// On mouse-up it reports a `SelectedRegion`; on Escape it cancels.
+/// On mouse-up it reports a `DisplayPixelRect`; on Escape it cancels.
 final class RegionSelector {
     private var overlays: [OverlayWindow] = []
-    private var completion: ((SelectedRegion?) -> Void)?
+    private var completion: ((DisplayPixelRect?) -> Void)?
     /// Only one overlay can be key, so its own keyDown saw Escape on one display
     /// only. The app is active while selecting, so a local monitor sees every key.
     private var escapeMonitor: Any?
 
-    func begin(completion: @escaping (SelectedRegion?) -> Void) {
+    func begin(completion: @escaping (DisplayPixelRect?) -> Void) {
         self.completion = completion
         // Activate first so we can claim foreground even from a full-screen Space,
         // then orderFrontRegardless on the panels — `makeKey` would have failed
@@ -45,7 +36,7 @@ final class RegionSelector {
         finish(with: nil)
     }
 
-    fileprivate func finish(with region: SelectedRegion?) {
+    fileprivate func finish(with region: DisplayPixelRect?) {
         if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
         escapeMonitor = nil
         for overlay in overlays { overlay.orderOut(nil) }
@@ -96,47 +87,13 @@ private final class OverlayWindow: NSPanel {
     override var canBecomeMain: Bool { false }
 
     private func commit(viewRect: NSRect) {
-        guard let screen = self.screen else { owner?.finish(with: nil); return }
-        let displayID = screen.displayID
-        let scale = screen.backingScaleFactor
-
-        // Convert AppKit (bottom-left, points, screen-local) → CG (top-left, pixels, display-local).
-        // viewRect is already in screen-local points (selection view fills the screen).
-        let topLeftYPoints = screen.frame.size.height - (viewRect.origin.y + viewRect.size.height)
-
-        let pixelRect = CGRect(
-            x: viewRect.origin.x * scale,
-            y: topLeftYPoints * scale,
-            width: viewRect.size.width * scale,
-            height: viewRect.size.height * scale
-        )
-
-        let region = SelectedRegion(
-            displayID: displayID,
-            pixelRect: pixelRect.integral
-        )
-        owner?.finish(with: region)
-    }
-}
-
-extension NSScreen {
-    static func screen(displayID: CGDirectDisplayID) -> NSScreen? {
-        screens.first { $0.displayID == displayID }
-    }
-
-    /// The screen covering the largest part of `rect` (AppKit coordinates), or nil
-    /// when it is on none of them.
-    static func screen(mostlyShowing rect: CGRect) -> NSScreen? {
-        func overlap(_ screen: NSScreen) -> CGFloat {
-            let shared = screen.frame.intersection(rect)
-            return shared.isNull ? 0 : shared.width * shared.height
+        // viewRect is in screen-local points (the selection view fills the screen);
+        // the conversion to display pixels lives with the type that needs them.
+        guard let screen = self.screen, let region = DisplayPixelRect(selection: viewRect, on: screen) else {
+            owner?.finish(with: nil)
+            return
         }
-        return screens.filter { overlap($0) > 0 }.max { overlap($0) < overlap($1) }
-    }
-
-    var displayID: CGDirectDisplayID {
-        (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-            ?? CGMainDisplayID()
+        owner?.finish(with: region)
     }
 }
 

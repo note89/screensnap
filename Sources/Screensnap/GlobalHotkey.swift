@@ -81,3 +81,36 @@ final class GlobalHotkey {
         if let handlerRef = handlerRef { RemoveEventHandler(handlerRef) }
     }
 }
+
+/// Whether Carbon accepted a system-wide shortcut. It can refuse; the surfaces that
+/// name the keys then stop advertising them.
+enum HotkeyRegistration {
+    case pending
+    case active(GlobalHotkey)
+    case refused
+
+    /// Registers now.
+    static func register(keyCode: Int, modifiers: Int, _ onFire: @escaping () -> Void) -> HotkeyRegistration {
+        GlobalHotkey(keyCode: keyCode, modifiers: modifiers, onFire).map { HotkeyRegistration.active($0) } ?? .refused
+    }
+
+    /// Pending counts: the keys are advertised until Carbon says no.
+    var respondsToPress: Bool {
+        switch self {
+        case .pending, .active: return true
+        case .refused: return false
+        }
+    }
+}
+
+/// A shortcut the app names on its surfaces, advertised only while pressing it does
+/// something.
+struct AdvertisedHotkey {
+    let keys: String
+    var registration: HotkeyRegistration
+
+    /// The keys to show, or nil when pressing them would do nothing.
+    var advertisedKeys: String? {
+        registration.respondsToPress ? keys : nil
+    }
+}

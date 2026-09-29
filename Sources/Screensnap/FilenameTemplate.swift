@@ -1,5 +1,44 @@
 import Foundation
 
+/// A file name without its extension that Finder shows and the file system takes.
+/// Made only by parsing, so every stem that reaches the file system, whether rendered
+/// from a template or typed as a rename, has passed the same rules and is refused
+/// with the same words.
+struct FileStem: Equatable {
+    enum ParseError: LocalizedError, Equatable {
+        case blank
+        case startsWithDot
+        case forbidden(Character)
+
+        var message: String {
+            switch self {
+            case .blank: return "A file name needs at least one character."
+            case .startsWithDot: return "A name starting with “.” would be hidden in Finder."
+            case .forbidden(let character): return "File names cannot contain “\(character)”."
+            }
+        }
+
+        var errorDescription: String? { message }
+    }
+
+    static let forbiddenCharacters: Set<Character> = ["/", ":"]
+
+    let text: String
+
+    /// Only for text assembled from parts that were already checked: a template's
+    /// literals passed `parse`, and its date fields render to digits.
+    fileprivate init(checked text: String) {
+        self.text = text
+    }
+
+    static func parse(_ text: String) -> Result<FileStem, ParseError> {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .failure(.blank) }
+        guard !text.hasPrefix(".") else { return .failure(.startsWithDot) }
+        if let character = text.first(where: forbiddenCharacters.contains) { return .failure(.forbidden(character)) }
+        return .success(FileStem(checked: text))
+    }
+}
+
 /// How a new recording is named: literal text mixed with date fields, written the
 /// way the settings field shows them (`%Y-%m-%dT%H-%M-%S`). A template can only be
 /// made by parsing, and parsing rejects anything that would not render to a usable,
@@ -31,17 +70,14 @@ struct FilenameTemplate: Equatable {
     }
 
     enum ParseError: Error, Equatable {
-        case blank
-        case startsWithDot
-        case forbidden(Character)
+        /// The text would not be a usable file name even before its fields render.
+        case stem(FileStem.ParseError)
         case unknownField(Character)
         case trailingPercent
 
         var message: String {
             switch self {
-            case .blank: return "A file name needs at least one character."
-            case .startsWithDot: return "A name starting with “.” would be hidden in Finder."
-            case .forbidden(let character): return "File names cannot contain “\(character)”."
+            case .stem(let error): return error.message
             case .unknownField(let character): return "%\(character) is not a date field. Use %Y %m %d %H %M %S, or %% for “%”."
             case .trailingPercent: return "A “%” at the end needs a field letter after it."
             }
@@ -53,7 +89,6 @@ struct FilenameTemplate: Equatable {
     let pieces: [Piece]
 
     static let standardText = "%Y-%m-%dT%H-%M-%S"
-    static let forbiddenCharacters: Set<Character> = ["/", ":"]
 
     private init(text: String, pieces: [Piece]) {
         self.text = text
@@ -61,13 +96,11 @@ struct FilenameTemplate: Equatable {
     }
 
     static func parse(_ text: String) -> Result<FilenameTemplate, ParseError> {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .failure(.blank) }
-        guard !text.hasPrefix(".") else { return .failure(.startsWithDot) }
+        if case .failure(let error) = FileStem.parse(text) { return .failure(.stem(error)) }
         var pieces: [Piece] = []
         var literal = ""
         var characters = text.makeIterator()
         while let character = characters.next() {
-            if Self.forbiddenCharacters.contains(character) { return .failure(.forbidden(character)) }
             guard character == "%" else {
                 literal.append(character)
                 continue
@@ -99,15 +132,17 @@ struct FilenameTemplate: Equatable {
         return template
     }()
 
-    /// The file name, without extension, for a recording started at `date`.
-    func stem(at date: Date, calendar: Calendar = .current) -> String {
+    /// The file name, without extension, for a recording started at `date`. A stem by
+    /// construction: the literals passed `parse` and the fields render to digits.
+    func stem(at date: Date, calendar: Calendar = .current) -> FileStem {
         let parts = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
-        return pieces.map { piece in
+        let rendered = pieces.map { piece in
             switch piece {
             case .literal(let text): return text
             case .field(let field): return field.render(parts)
             }
         }.joined()
+        return FileStem(checked: rendered)
     }
 }
 
