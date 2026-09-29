@@ -31,6 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         coordinator.start()
     }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        coordinator.handleQuitRequest()
+    }
 }
 
 /// Uncaught Obj-C exceptions and fatal signals leave a line in stderr before the

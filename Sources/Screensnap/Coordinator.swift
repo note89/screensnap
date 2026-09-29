@@ -64,6 +64,21 @@ enum HotkeyRegistration {
     }
 }
 
+/// What quitting in the middle of an activity would cost.
+private enum QuitRisk {
+    case safe
+    /// Capturing: quitting would throw the recording away.
+    case losesRecording
+    /// Encoding or shrinking: quitting would cut the file off half-written.
+    case interruptsSave
+}
+
+/// A quit the app has accepted but not carried out, because a save is still running.
+private enum PendingQuit {
+    case notRequested
+    case waitingForSave
+}
+
 /// What the coordinator is doing, together with the things that exist only while
 /// doing it: the region overlay, the countdown timer, the recording session, and the
 /// timer that clears a settled message. Views see `phase`, its projection.
@@ -87,6 +102,15 @@ enum HotkeyRegistration {
         case .recording(_, let run): return .recording(run)
         case .finishing(let step): return .finishing(step)
         case .settled(let settlement, _): return .settled(settlement)
+        }
+    }
+
+    /// A countdown or picker has produced nothing yet, so quitting there loses nothing.
+    var quitRisk: QuitRisk {
+        switch self {
+        case .recording: return .losesRecording
+        case .finishing: return .interruptsSave
+        case .idle, .choosingRegion, .choosingSource, .starting, .countingDown, .settled: return .safe
         }
     }
 }
@@ -114,6 +138,7 @@ final class Coordinator: FrameSink {
     @ObservationIgnored private let countdownOverlay = CountdownOverlay()
     @ObservationIgnored private let grantPanel = GrantPanel()
     @ObservationIgnored private let permissionsAtLaunch: PermissionReport
+    @ObservationIgnored private var pendingQuit = PendingQuit.notRequested
 
     init() {
         permissionsAtLaunch = Permissions.check()
@@ -162,6 +187,44 @@ final class Coordinator: FrameSink {
 
     func requestMicrophone() {
         Task { _ = await Permissions.ensureMicrophoneAccess(); refreshPermissions() }
+    }
+
+    // MARK: Quitting
+
+    /// The app delegate's answer to ⌘Q. A recording in progress is finished or
+    /// discarded first, as the user chooses; a save in progress is waited for.
+    /// `enter(_:)` releases the quit once nothing is left to lose.
+    func handleQuitRequest() -> NSApplication.TerminateReply {
+        switch activity.quitRisk {
+        case .safe:
+            return .terminateNow
+        case .interruptsSave:
+            pendingQuit = .waitingForSave
+            return .terminateLater
+        case .losesRecording:
+            guard let reason = askHowToEndRecording() else { return .terminateCancel }
+            // The alert ran a modal loop, and ⌘⇧. or a failure may have ended the
+            // recording meanwhile.
+            guard case .recording = activity else { return handleQuitRequest() }
+            pendingQuit = .waitingForSave
+            Task { await stop(reason) }
+            return .terminateLater
+        }
+    }
+
+    private func askHowToEndRecording() -> StopReason? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "A recording is in progress"
+        alert.informativeText = "Finish and save it before quitting, or discard it?"
+        alert.addButton(withTitle: "Finish and Quit")
+        alert.addButton(withTitle: "Discard and Quit")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .finish
+        case .alertSecondButtonReturn: return .discard
+        default: return nil
+        }
     }
 
     // MARK: Recording flow
@@ -390,15 +453,17 @@ final class Coordinator: FrameSink {
         guard case .recording(let session, let run) = activity else { return }
         switch reason {
         case .discard:
+            // Before settling, so the partial file is gone by the time a pending
+            // quit is released. The sink ignores frames that arrive after.
+            session.encoder.cancel()
             settle(.discarded)
             await session.recorder.stop()
             session.stopDevices()
-            session.encoder.cancel()
         case .restart:
+            session.encoder.cancel()
             enter(.starting(run.output))
             await session.recorder.stop()
             session.stopDevices()
-            session.encoder.cancel()
             await begin(source: session.source)
         case .finish:
             enter(.finishing(.encoding(run.output)))
@@ -449,10 +514,10 @@ final class Coordinator: FrameSink {
 
     private func abort(_ error: Error) async {
         guard case .recording(let session, _) = activity else { return }
+        session.encoder.cancel()
         settle(.failed(error.localizedDescription))
         await session.recorder.stop()
         session.stopDevices()
-        session.encoder.cancel()
     }
 
     private func settle(_ settlement: Settlement) {
@@ -488,6 +553,15 @@ final class Coordinator: FrameSink {
         }
         hud.render(phase)
         menuBar.render(phase)
+        if case .waitingForSave = pendingQuit, case .safe = next.quitRisk {
+            pendingQuit = .notRequested
+            // A save that failed cancels the quit, so its message stays on screen.
+            if case .settled(.failed, _) = next {
+                NSApp.reply(toApplicationShouldTerminate: false)
+            } else {
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
     }
 
     // MARK: FrameSink
