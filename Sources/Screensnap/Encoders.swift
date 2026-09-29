@@ -428,7 +428,7 @@ final class MP4Encoder: FrameEncoder {
             AVVideoWidthKey: Int(pixelSize.width),
             AVVideoHeightKey: Int(pixelSize.height),
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: max(1_000_000, Int(pixelSize.width * pixelSize.height) * 4),
+                AVVideoAverageBitRateKey: Self.averageBitRate(pixelSize: pixelSize, framerate: framerate),
                 AVVideoMaxKeyFrameIntervalKey: framerate * 2,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],
@@ -468,6 +468,15 @@ final class MP4Encoder: FrameEncoder {
         case .none:
             self.audioChannel = nil
         }
+    }
+
+    /// Bits per pixel per frame, so the budget follows the framerate: 1 fps and 60 fps
+    /// used to get the same bits per second. 0.12 is generous for screen content —
+    /// flat colour and text — and ~18 Mbps for a Retina laptop screen at 30 fps.
+    private static let bitsPerPixelPerFrame = 0.12
+
+    private static func averageBitRate(pixelSize: CGSize, framerate: Int) -> Int {
+        max(1_000_000, Int(pixelSize.width * pixelSize.height * Double(framerate) * bitsPerPixelPerFrame))
     }
 
     func append(_ frame: CapturedFrame) throws {
