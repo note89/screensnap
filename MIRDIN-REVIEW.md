@@ -6,7 +6,8 @@ Embedded Design Principle, the Representable/Valid principle, hidden coupling
 and information hiding, Hoare-style contracts, consistency, dark knowledge.
 `DESIGN-REVIEW.md` reviewed the *concepts*; this one reviews how faithfully the
 code embeds them. Findings are ranked; each names the principle, the evidence,
-and the change that would resolve it.
+and the change that would resolve it. The line references are to `e177ec0`, the
+tree as reviewed; "Resolutions" at the end says what each finding became.
 
 ## Bottom line
 
@@ -504,3 +505,30 @@ the findings above are measured against, and are worth keeping as they are.
 3. Finding 2 (mechanical, wide; best done in one pass with the compiler driving).
 4. Findings 5, 6, 7 (all inside `begin()`/`Encoders.swift`; one PR).
 5. The rest as they are touched.
+
+---
+
+## Resolutions
+
+What each finding became in the tree that followed the review.
+
+| # | Resolution |
+|---|------------|
+| 1 | `ScreenRecorder.stop()` returns the recording's length on its own clock and `FrameEncoder.finish(at:)` takes it; the ImageIO encoder no longer reads the host clock, and the gifski fallback closes at the same `end`. `pause()` returns the elapsed time and the pill's `RecordingClock` is fed from it, so the pill, the file and the audio agree by construction. |
+| 2 | `ScreenRect` (global AppKit points) and `DisplayPixelRect` (display-local pixels, with its display) in `ScreenGeometry.swift`, with the conversions as constructors. `CaptureSource.resolveGeometry()` measures a source once into a `CaptureGeometry` that the recorder, the encoder, the preview and the countdown all read. |
+| 3 | `Compressor` builds on the recording's volume (`itemReplacementDirectory`) and, for replace-original, stages the result beside the original before trashing it; a failed swap leaves the staged file and says so (`CompressionError.leftBeside`). |
+| 4 | One job slot: `Coordinator.run(_:info:)` is the only way a compression runs, and the size-limit fit goes through it with `CompressionJob.origin == .sizeLimit`. `FinishStep.fittingToLimit` shows the slot's progress; a slot already taken yields `FitOutcome.skipped` instead of a second compression. |
+| 5 | `EncoderChoice` is decided once by `Coordinator.plan` and the microphone fallback rewrites it, so `RecordingRun.output` is what the encoder produces. `EncoderSetup.make(_:)` takes the choice alone; `MicrophoneCapture.deliver(to:)` lets the microphone come up before the encoder exists. |
+| 6 | The sequence is written on `FrameEncoder` and kept by one `EncoderLifecycle` in all three encoders. `AudioWriterChannel.State` and `MP4Encoder.Session` are enums; a finished writer cannot be resumed, appended to, or finished twice. |
+| 7 | `SessionSetup` accumulates what `begin()` brings up and `abandon()` releases whatever is there; every exit calls it. |
+| 8 | `FileStem` is the one parser for a usable file name; the template renders to one and rename takes one. `OutputContainer`'s cases are the one list of recording extensions; `Recording` and the legacy-folder check derive from it. `Clipboard.copy` takes a `Recording`. |
+| 9 | `HUDPanel.Stage.live(Live)` carries presence and the hotkey; `Visibility.shown(on:drag:)` carries the drag. ⌃⌘H is an `AdvertisedHotkey`, and every surface reads its keys from `HUDChrome.presenceKeys`, nil when Carbon refused it. |
+| 10 | A source whose display is gone fails `begin()` with a message instead of a zero rectangle or a guessed scale; `NSScreen.displayID` is optional. `SourcePicker.choose` takes a `PickableKind` and answers with `SourceChoice`, so a failed content query reaches the pill. |
+| 11 | `RecordingsStore` owns the folder and remembers it; `Settings.saveFolder` is gone, and `newRecordingURL` lives with the folder it names into. |
+| 12 | `GifskiAvailability` on the coordinator, refreshed with the permissions; `plan` consumes it and `GifskiEncoder.init(gifski:)` takes the located URL. |
+| 13 | `Settlement.saved(SavedRecording)` carries the degradations, the `FitOutcome` and what `deliver` did (`Delivered`); the pill renders those. |
+| 14 | `requestInfo(for:)` / `requestThumbnail(for:)` for views, `loadInfo(for:)` for callers that wait. |
+| 15 | `Framerate` reaches every encoder; the re-clamp is gone. |
+| 16 | `Coordinator.quit(then:)` is the one entry; `PendingQuit.waitingForSave(then:)` carries the intent and `afterQuit` records the accepted one for the delegate. `Relaunch` only launches. `Updater.install()` reports an `InstallOutcome` and the coordinator relaunches. |
+| 17 | The pill sees a `HUDModel` protocol, not the coordinator. `Dimensions`, `PixelPoint` and `PixelRect` live in `Geometry.swift`; the check script lists it and CI runs the checks. A second SwiftPM target is still deferred. |
+| 18 | `FacecamOverlay` draws the bubble on the capture queue, reading `CameraCapture` and a `FacecamPlacementSource` the preview publishes to on every move. The main-actor hop remains only to hand the finished frame to the encoder, which is main-actor bound. |

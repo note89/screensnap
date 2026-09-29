@@ -15,12 +15,13 @@ struct PickerItem: Identifiable {
     static func displays(in content: SCShareableContent) -> [PickerItem] {
         content.displays.enumerated().map { index, display in
             let screen = NSScreen.screen(displayID: display.displayID)
+            let source = CaptureSource.display(display)
             return PickerItem(
                 id: "display-\(display.displayID)",
                 title: screen?.localizedName ?? "Display \(index + 1)",
-                subtitle: CaptureSource.display(display).pixelSize.asDimensions.label,
+                subtitle: source.resolveGeometry()?.pixelSize.label ?? "\(display.width)×\(display.height)",
                 icon: nil,
-                source: .display(display),
+                source: source,
                 filter: SCContentFilter(display: display, excludingWindows: []),
                 aspect: CGFloat(display.width) / CGFloat(max(1, display.height))
             )
@@ -47,26 +48,52 @@ struct PickerItem: Identifiable {
     }
 }
 
-/// Resolves a capture mode to a concrete source. A lone display needs no question;
+/// What the picker chooses between. A region is drawn, not picked, so it is not an
+/// option here.
+enum PickableKind {
+    case display
+    case window
+
+    var captureMode: CaptureMode {
+        switch self {
+        case .display: return .display
+        case .window: return .window
+        }
+    }
+}
+
+/// How a pick ended. Each outcome asks something different of the caller.
+enum SourceChoice {
+    case picked(CaptureSource)
+    case cancelled
+    /// ScreenCaptureKit would not list what is on screen.
+    case unavailable(Error)
+}
+
+/// Resolves a kind of source to a concrete one. A lone display needs no question;
 /// everything else gets a picker window with live thumbnails.
 @MainActor
 enum SourcePicker {
-    static func choose(_ mode: CaptureMode) async -> CaptureSource? {
-        guard let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true) else { return nil }
+    static func choose(_ kind: PickableKind) async -> SourceChoice {
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        } catch {
+            return .unavailable(error)
+        }
         let items: [PickerItem]
-        switch mode {
-        case .region:
-            return nil
+        switch kind {
         case .display:
-            if content.displays.count == 1, let only = content.displays.first { return .display(only) }
+            if content.displays.count == 1, let only = content.displays.first { return .picked(.display(only)) }
             items = PickerItem.displays(in: content)
         case .window:
             items = PickerItem.windows(in: content)
         }
-        return await withCheckedContinuation { continuation in
-            let panel = SourcePickerPanel(mode: mode, items: items) { continuation.resume(returning: $0) }
+        let picked: CaptureSource? = await withCheckedContinuation { (continuation: CheckedContinuation<CaptureSource?, Never>) in
+            let panel = SourcePickerPanel(kind: kind, items: items) { continuation.resume(returning: $0) }
             panel.present()
         }
+        return picked.map(SourceChoice.picked) ?? .cancelled
     }
 }
 
@@ -74,7 +101,7 @@ enum SourcePicker {
 private final class SourcePickerPanel: NSPanel, NSWindowDelegate {
     private var completion: ((CaptureSource?) -> Void)?
 
-    init(mode: CaptureMode, items: [PickerItem], completion: @escaping (CaptureSource?) -> Void) {
+    init(kind: PickableKind, items: [PickerItem], completion: @escaping (CaptureSource?) -> Void) {
         self.completion = completion
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
@@ -82,13 +109,13 @@ private final class SourcePickerPanel: NSPanel, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        title = "Record \(mode.label.lowercased())"
+        title = "Record \(kind.captureMode.label.lowercased())"
         titlebarAppearsTransparent = true
         level = .floating
         isReleasedWhenClosed = false
         collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         delegate = self
-        contentView = NSHostingView(rootView: SourcePickerView(mode: mode, items: items) { [weak self] source in
+        contentView = NSHostingView(rootView: SourcePickerView(kind: kind, items: items) { [weak self] source in
             self?.finish(with: source)
         })
     }
@@ -120,13 +147,13 @@ private final class SourcePickerPanel: NSPanel, NSWindowDelegate {
 }
 
 private struct SourcePickerView: View {
-    let mode: CaptureMode
+    let kind: PickableKind
     let items: [PickerItem]
     let pick: (CaptureSource) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(mode == .window ? "Which window?" : "Which display?")
+            Text(kind == .window ? "Which window?" : "Which display?")
                 .font(.title2.bold())
             Text("Click one to start recording. Esc to cancel.")
                 .foregroundStyle(.secondary)
@@ -202,8 +229,4 @@ private struct PickerCard: View {
         config.showsCursor = false
         return try? await SCScreenshotManager.captureImage(contentFilter: item.filter, configuration: config)
     }
-}
-
-extension CGSize {
-    var asDimensions: Dimensions { Dimensions(self) }
 }

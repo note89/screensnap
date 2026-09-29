@@ -65,9 +65,18 @@ enum UpdateError: LocalizedError {
     }
 }
 
-/// Checks GitHub Releases for a newer tag, downloads the zip, swaps the bundle in
-/// place and relaunches. Only builds signed with the team's Developer ID install;
-/// that same identity is what lets TCC keep treating the update as the same app.
+/// What `install()` did. `installed` means the bundle on disk is the new version and
+/// this process is stale; the caller relaunches.
+enum InstallOutcome {
+    case installed
+    case parkedInFinder
+    case failed
+    case nothingToInstall
+}
+
+/// Checks GitHub Releases for a newer tag, downloads the zip and swaps the bundle in
+/// place. Only builds signed with the team's Developer ID install; that same
+/// identity is what lets TCC keep treating the update as the same app.
 @MainActor @Observable
 final class Updater {
     static let repository = "note89/screensnap"
@@ -109,8 +118,8 @@ final class Updater {
         }
     }
 
-    func install() async {
-        guard case .available(let release) = state else { return }
+    func install() async -> InstallOutcome {
+        guard case .available(let release) = state else { return .nothingToInstall }
         do {
             let bundleURL = Bundle.main.bundleURL
             guard bundleURL.pathExtension == "app" else { throw UpdateError.notABundle }
@@ -132,12 +141,13 @@ final class Updater {
                 try FileManager.default.moveItem(at: newApp, to: parked)
                 NSWorkspace.shared.activateFileViewerSelecting([parked])
                 state = .readyInFinder(parked)
-                return
+                return .parkedInFinder
             }
             try Self.swap(current: bundleURL, with: newApp, backupIn: workDir)
-            Relaunch.now()
+            return .installed
         } catch {
             state = .failed(error.localizedDescription)
+            return .failed
         }
     }
 

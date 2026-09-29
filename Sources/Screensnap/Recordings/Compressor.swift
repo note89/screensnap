@@ -80,12 +80,19 @@ enum CompressionError: LocalizedError {
     case unreadable
     case exportUnavailable
     case exportFailed(String)
+    /// The one job slot is taken.
+    case busy
+    /// The result is complete and in the folder under a stand-in name; only the
+    /// swap with the original did not happen.
+    case leftBeside(URL, reason: String)
 
     var errorDescription: String? {
         switch self {
         case .unreadable: return "Could not read the recording."
         case .exportUnavailable: return "This Mac cannot export the recording in that format."
         case .exportFailed(let reason): return "Compression failed: \(reason)"
+        case .busy: return "Another compression is still running."
+        case .leftBeside(let url, let reason): return "The compressed file is saved as \(url.lastPathComponent), but the original could not be replaced: \(reason)"
         }
     }
 }
@@ -95,6 +102,11 @@ typealias ProgressHandler = @Sendable (Double) -> Void
 /// Re-encodes a recording to a smaller file. MP4 goes through `AVAssetExportSession`
 /// with a file-length cap; GIF is re-encoded frame by frame, shrinking and thinning
 /// frames until it fits.
+///
+/// The result is built on the recording's own volume and moved into its folder by
+/// rename, so the folder holds a complete file at every step: the original until it
+/// is trashed, the result from before that. A crash or a quit part-way loses nothing
+/// that was there.
 enum Compressor {
     static func compress(
         _ recording: Recording,
@@ -103,10 +115,11 @@ enum Compressor {
         placement: CompressionPlacement,
         progress: @escaping ProgressHandler
     ) async throws -> CompressionResult {
-        let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("screensnap-compress-\(UUID().uuidString)")
-            .appendingPathExtension(recording.url.pathExtension)
-        defer { try? FileManager.default.removeItem(at: scratch) }
+        let scratchFolder = try FileManager.default.url(
+            for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: recording.url, create: true
+        )
+        defer { try? FileManager.default.removeItem(at: scratchFolder) }
+        let scratch = scratchFolder.appendingPathComponent("compressed").appendingPathExtension(recording.url.pathExtension)
 
         let fit: SizeFit
         switch recording.container {
@@ -120,20 +133,26 @@ enum Compressor {
     }
 
     private static func place(_ scratch: URL, for recording: Recording, target: CompressionTarget, placement: CompressionPlacement) throws -> URL {
-        let destination: URL
+        let folder = recording.url.deletingLastPathComponent()
+        let pathExtension = recording.url.pathExtension
         switch placement {
-        case .replaceOriginal:
-            try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
-            destination = recording.url
         case .sibling:
-            destination = FileManager.default.unusedURL(
-                in: recording.url.deletingLastPathComponent(),
-                stem: "\(recording.name)-\(target.fileSuffix)",
-                pathExtension: recording.url.pathExtension
-            )
+            let destination = FileManager.default.unusedURL(in: folder, stem: "\(recording.name)-\(target.fileSuffix)", pathExtension: pathExtension)
+            try FileManager.default.moveItem(at: scratch, to: destination)
+            return destination
+        case .replaceOriginal:
+            // Into the folder first, under a stand-in name, so the original is only
+            // trashed once its replacement is already beside it.
+            let staged = FileManager.default.unusedURL(in: folder, stem: "\(recording.name)-compressing", pathExtension: pathExtension)
+            try FileManager.default.moveItem(at: scratch, to: staged)
+            do {
+                try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
+                try FileManager.default.moveItem(at: staged, to: recording.url)
+            } catch {
+                throw CompressionError.leftBeside(staged, reason: error.localizedDescription)
+            }
+            return recording.url
         }
-        try FileManager.default.moveItem(at: scratch, to: destination)
-        return destination
     }
 
     /// Asks the file system every time. `URL.resourceValues` caches on the URL, and off

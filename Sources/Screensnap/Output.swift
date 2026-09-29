@@ -1,7 +1,7 @@
 import Foundation
 
 /// Which GIF encoder produces the file. `best` needs the external gifski binary
-/// and falls back to `fast` at pick time when it is missing (see `Output.effective`).
+/// and falls back to `fast` at pick time when it is missing (see `Coordinator.plan`).
 enum GifQuality: String, Codable, CaseIterable {
     case fast
     case best
@@ -55,13 +55,11 @@ enum Output: Equatable, Codable {
     }
 }
 
+/// The file types a recording can be. The raw value is the file extension, so a
+/// file counts as a recording exactly when its extension names a case.
 enum OutputContainer: String, Codable, CaseIterable {
     case gif
     case mp4
-
-    init(url: URL) {
-        self = url.pathExtension.lowercased() == "mp4" ? .mp4 : .gif
-    }
 }
 
 /// An upper bound on the finished file. Shared per-service ceilings are named so the
@@ -122,34 +120,4 @@ struct ByteCount: Hashable, Comparable, Codable {
     var formatted: String { Self.formatter.string(fromByteCount: bytes) }
 
     static func < (lhs: ByteCount, rhs: ByteCount) -> Bool { lhs.bytes < rhs.bytes }
-}
-
-/// Pixel dimensions of a recording, kept as one value because width and height
-/// only ever travel together.
-struct Dimensions: Equatable, Codable {
-    let width: Int
-    let height: Int
-
-    init(width: Int, height: Int) {
-        self.width = width
-        self.height = height
-    }
-
-    init(_ size: CGSize) {
-        self.init(width: Int(size.width.rounded()), height: Int(size.height.rounded()))
-    }
-
-    var label: String { "\(width)×\(height)" }
-    var shortEdge: Int { min(width, height) }
-
-    /// Even dimensions, as H.264 requires; scaled proportionally.
-    func scaled(by factor: Double) -> Dimensions {
-        Dimensions(width: max(2, Int(Double(width) * factor) & ~1), height: max(2, Int(Double(height) * factor) & ~1))
-    }
-
-    /// Scale so the short edge matches `shortEdge` pixels; never upscales.
-    func fitting(shortEdge target: Int) -> Dimensions {
-        guard target < shortEdge else { return self }
-        return scaled(by: Double(target) / Double(shortEdge))
-    }
 }

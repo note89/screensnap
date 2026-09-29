@@ -1,15 +1,36 @@
+import Observation
 import SwiftUI
 
+/// What the pill can see and do. `Coordinator` is the one implementation; the pill
+/// depends on this much of it and no more.
+@MainActor
+protocol HUDModel: AnyObject, Observable {
+    var phase: Phase { get }
+    /// Zero unless recording with a microphone.
+    var micLevel: Float { get }
+    /// The compression under way, whose progress the shrink-to-fit step shows.
+    var compression: CompressionJob? { get }
+    /// The keys that finish a recording, or nil when they would do nothing.
+    var finishKeys: String? { get }
+    func cancelCountdown()
+    func finish()
+    func togglePause()
+    func restart()
+    func discard()
+    func dismissSettled()
+    func reveal(_ recording: Recording)
+}
+
 struct HUDView: View {
-    let coordinator: Coordinator
+    let model: any HUDModel
     let hud: HUDPanel
 
     var body: some View {
         switch hud.chrome.layout {
         case .pill(let axis):
-            Pill(coordinator: coordinator, hud: hud, axis: axis)
+            Pill(model: model, hud: hud, axis: axis)
         case .marker:
-            TuckedMarker(phase: coordinator.phase, show: hud.togglePresence)
+            TuckedMarker(phase: model.phase, keys: hud.chrome.presenceKeys, show: hud.togglePresence)
                 .frame(width: HUDLayout.marker.size.width, height: HUDLayout.marker.size.height)
         }
     }
@@ -18,12 +39,12 @@ struct HUDView: View {
 /// Horizontal along the bottom edge, a narrow column on a side edge. Messages
 /// (encoding, saved, failed) are always horizontal; the panel sizes for that.
 private struct Pill: View {
-    let coordinator: Coordinator
+    let model: any HUDModel
     let hud: HUDPanel
     let axis: Axis
 
     private var pillOpacity: Double {
-        if case .settled(.saved) = coordinator.phase { return 0.72 }
+        if case .settled(.saved) = model.phase { return 0.72 }
         return 0.86
     }
 
@@ -38,7 +59,7 @@ private struct Pill: View {
         let size = HUDLayout.pill(axis).size
         stack {
             DragGrip(axis: axis)
-            switch coordinator.phase {
+            switch model.phase {
             case .idle, .pickingSource:
                 EmptyView()
             case .starting(let output):
@@ -57,22 +78,22 @@ private struct Pill: View {
                 case .horizontal:
                     Text("Recording \(output.label) in…").foregroundStyle(.white.opacity(0.8))
                     Spacer(minLength: 0)
-                    PillButton(title: "Cancel", role: .quiet) { coordinator.cancelCountdown() }
+                    PillButton(title: "Cancel", role: .quiet) { model.cancelCountdown() }
                 case .vertical:
-                    PillButton(systemImage: "xmark", role: .quiet) { coordinator.cancelCountdown() }.help("Cancel")
+                    PillButton(systemImage: "xmark", role: .quiet) { model.cancelCountdown() }.help("Cancel")
                 }
-                TuckButton(tuck: hud.togglePresence)
+                TuckButton(keys: hud.chrome.presenceKeys, tuck: hud.togglePresence)
             case .recording(let run):
-                RecordingRow(run: run, axis: axis, micLevel: coordinator.micLevel, finishKeys: coordinator.hotkey.advertisedKeys, finish: coordinator.finish, togglePause: coordinator.togglePause, restart: coordinator.restart, discard: coordinator.discard)
-                TuckButton(tuck: hud.togglePresence)
+                RecordingRow(run: run, axis: axis, micLevel: model.micLevel, finishKeys: model.finishKeys, finish: model.finish, togglePause: model.togglePause, restart: model.restart, discard: model.discard)
+                TuckButton(keys: hud.chrome.presenceKeys, tuck: hud.togglePresence)
             case .finishing(let step):
                 ProgressView().controlSize(.small).tint(.white)
                 Text(step.label).foregroundStyle(.white.opacity(0.85))
-                if case .fittingToLimit(_, let progress) = step {
-                    ProgressView(value: progress).tint(.white).frame(width: 90)
+                if case .fittingToLimit = step, let job = model.compression {
+                    ProgressView(value: job.progress).tint(.white).frame(width: 90)
                 }
             case .settled(let settlement):
-                SettledRow(settlement: settlement, coordinator: coordinator)
+                SettledRow(settlement: settlement, model: model)
             }
         }
         .font(.system(size: 13, weight: .medium, design: .rounded))
@@ -90,7 +111,7 @@ private struct Pill: View {
         )
         .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
         .frame(width: size.width, height: size.height)
-        .animation(.easeOut(duration: 0.18), value: coordinator.phase)
+        .animation(.easeOut(duration: 0.18), value: model.phase)
     }
 }
 
@@ -108,17 +129,21 @@ private struct DragGrip: View {
 }
 
 private struct TuckButton: View {
+    /// nil when the shortcut could not be registered; the marker still brings the pill back.
+    let keys: String?
     let tuck: () -> Void
 
     var body: some View {
         PillButton(systemImage: "eye.slash", role: .quiet, action: tuck)
-            .help("Hide controls — \(HUDPanel.presenceShortcut) (\(HUDPanel.presenceShortcutSpoken)) brings them back")
+            .help(keys.map { "Hide controls — \($0) (\(HUDPanel.presenceKeysSpoken)) brings them back" }
+                ?? "Hide controls — click the marker in the corner to bring them back")
     }
 }
 
 /// What is left of the pill when tucked: small, faint, in a corner, and clickable.
 private struct TuckedMarker: View {
     let phase: Phase
+    let keys: String?
     let show: () -> Void
 
     @State private var hovering = false
@@ -127,7 +152,11 @@ private struct TuckedMarker: View {
         Button(action: show) {
             HStack(spacing: 5) {
                 indicator
-                Text(HUDPanel.presenceShortcut)
+                if let keys {
+                    Text(keys)
+                } else {
+                    Image(systemName: "eye")
+                }
             }
             .font(.system(size: 11, weight: .semibold, design: .rounded))
             .foregroundStyle(.white)
@@ -139,7 +168,7 @@ private struct TuckedMarker: View {
         .buttonStyle(.plain)
         .opacity(hovering ? 1 : 0.4)
         .onHover { hovering = $0 }
-        .help("Show controls — \(HUDPanel.presenceShortcut) (\(HUDPanel.presenceShortcutSpoken))")
+        .help(keys.map { "Show controls — \($0) (\(HUDPanel.presenceKeysSpoken))" } ?? "Show controls")
     }
 
     @ViewBuilder private var indicator: some View {
@@ -221,23 +250,23 @@ private struct RecordingRow: View {
 
 private struct SettledRow: View {
     let settlement: Settlement
-    let coordinator: Coordinator
+    let model: any HUDModel
 
     var body: some View {
         switch settlement {
-        case .saved(let recording, let notes):
+        case .saved(let saved):
             Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.green)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Saved · \(recording.bytes.formatted)\(coordinator.settings.delivery.clipboard.applies(to: OutputContainer(url: recording.url)) ? " · ⌘V to paste" : "")")
+                Text("Saved · \(saved.recording.bytes.formatted)\(saved.delivered.copiedToClipboard ? " · ⌘V to paste" : "")")
                     .foregroundStyle(.white)
-                if !notes.isEmpty {
-                    Text(notes.joined(separator: " · ")).font(.caption).foregroundStyle(.orange).lineLimit(1)
+                if !saved.notes.isEmpty {
+                    Text(saved.notes.joined(separator: " · ")).font(.caption).foregroundStyle(.orange).lineLimit(1)
                 }
             }
             Spacer(minLength: 4)
             PillButton(title: "Show", role: .quiet) {
-                coordinator.library.reveal(recording)
-                coordinator.dismissSettled()
+                model.reveal(saved.recording)
+                model.dismissSettled()
             }
         case .discarded:
             Image(systemName: "trash").foregroundStyle(.white.opacity(0.7))
@@ -246,7 +275,7 @@ private struct SettledRow: View {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.orange)
             Text(message).foregroundStyle(.white).lineLimit(2)
             Spacer(minLength: 4)
-            PillButton(systemImage: "xmark", role: .quiet) { coordinator.dismissSettled() }
+            PillButton(systemImage: "xmark", role: .quiet) { model.dismissSettled() }
         }
     }
 }

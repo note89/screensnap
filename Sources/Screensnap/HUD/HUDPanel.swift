@@ -77,9 +77,13 @@ enum HUDLayout: Equatable {
     }
 }
 
+/// What the SwiftUI side of the pill reads from the panel.
 @MainActor @Observable
 final class HUDChrome {
     fileprivate(set) var layout: HUDLayout = .pill(.horizontal)
+    /// The keys that tuck and bring back the controls, or nil while pressing them
+    /// would do nothing: outside a live stage, or when Carbon refused them.
+    fileprivate(set) var presenceKeys: String?
 }
 
 /// The one floating pill. Countdown, recording controls, encoding progress and the
@@ -90,8 +94,8 @@ final class HUDPanel {
     /// Tucks and brings back the controls. A letter, so it cannot be misread the way
     /// "," was; far from ⌘⇧. (finish), so a slip does not end the recording; and not
     /// Escape, which editors press all day.
-    static let presenceShortcut = "⌃⌘H"
-    static let presenceShortcutSpoken = "Control-Command-H"
+    static let presenceKeys = "⌃⌘H"
+    static let presenceKeysSpoken = "Control-Command-H"
     private static let bottomGap: CGFloat = 28
     private static let sideGap: CGFloat = 8
     private static let cornerGap: CGFloat = 4
@@ -102,18 +106,26 @@ final class HUDPanel {
         static let dockAlong = "interface.hudDock.along"
     }
 
+    /// A live stage carries controls: whether they are tucked, and the hotkey that
+    /// tucks them, held only while there are controls to tuck so ⌃⌘H reaches other
+    /// apps the rest of the time.
+    private struct Live {
+        var presence: HUDPresence
+        let hotkey: AdvertisedHotkey
+    }
+
     /// Live stages carry controls and follow the dock, vertical on a side edge.
     /// Reports are messages: always read horizontally, never tucked.
     private enum Stage {
         case absent
-        case live
+        case live(Live)
         case report
     }
 
-    private enum Visibility {
-        case hidden
-        /// Chosen when the pill appears, so it stays on one screen for the whole run.
-        case shown(on: NSScreen?)
+    private enum StageKind {
+        case absent
+        case live
+        case report
     }
 
     /// Where the pointer and panel were when the drag (or its last reshape) began,
@@ -124,14 +136,18 @@ final class HUDPanel {
         let edge: HUDDock.Edge
     }
 
+    private enum Visibility {
+        case hidden
+        /// `screen` is chosen when the pill appears, so it stays on one screen for the
+        /// whole run. A drag exists only while shown; hiding ends it.
+        case shown(on: NSScreen?, drag: Drag?)
+    }
+
     let chrome = HUDChrome()
     private let panel: NSPanel
     private let defaults: UserDefaults
     private var visibility = Visibility.hidden
     private var stage = Stage.absent
-    private var presence = HUDPresence.shown
-    private var drag: Drag?
-    private var hotkey: GlobalHotkey?
     private var dock: HUDDock {
         didSet {
             defaults.set(dock.edge.rawValue, forKey: Key.dockEdge)
@@ -166,50 +182,59 @@ final class HUDPanel {
         panel.sharingType = .none
     }
 
-    func attach(_ coordinator: Coordinator) {
-        let host = FirstMouseHostingView(rootView: HUDView(coordinator: coordinator, hud: self))
+    func attach(_ model: any HUDModel) {
+        let host = FirstMouseHostingView(rootView: HUDView(model: model, hud: self))
         // The panel's frame follows `chrome.layout`, set here; the view must not resize it.
         host.sizingOptions = []
         panel.contentView = host
     }
 
     func render(_ phase: Phase) {
-        stage = Self.stage(of: phase)
-        switch stage {
+        switch Self.stageKind(of: phase) {
         case .absent:
-            presence = .shown
-            hotkey = nil
+            stage = .absent
+            chrome.presenceKeys = nil
             hide()
         case .live:
-            claimHotkey()
+            // Entering a live stage claims the hotkey and shows the controls; staying
+            // in one (countdown → recording) keeps them as the user left them.
+            if case .live = stage {} else {
+                let hotkey = AdvertisedHotkey(
+                    keys: Self.presenceKeys,
+                    registration: .register(keyCode: kVK_ANSI_H, modifiers: controlKey | cmdKey) { [weak self] in self?.togglePresence() }
+                )
+                stage = .live(Live(presence: .shown, hotkey: hotkey))
+                chrome.presenceKeys = hotkey.advertisedKeys
+            }
             show()
         case .report:
-            presence = .shown
-            hotkey = nil
+            stage = .report
+            chrome.presenceKeys = nil
             show()
-        }
-    }
-
-    /// Held only while there are controls to tuck, so ⌃⌘H reaches other apps the
-    /// rest of the time.
-    private func claimHotkey() {
-        guard hotkey == nil else { return }
-        hotkey = GlobalHotkey(keyCode: kVK_ANSI_H, modifiers: controlKey | cmdKey) { [weak self] in
-            self?.togglePresence()
         }
     }
 
     func togglePresence() {
-        guard case .live = stage else { return }
-        drag = nil
-        switch presence {
-        case .shown: presence = .tucked
-        case .tucked: presence = .shown
+        guard case .live(var live) = stage else { return }
+        switch live.presence {
+        case .shown: live.presence = .tucked
+        case .tucked: live.presence = .shown
         }
+        stage = .live(live)
+        setDrag(nil)
         relayout(animated: false)
     }
 
     // MARK: Dragging
+
+    private var drag: Drag? {
+        if case .shown(_, let drag) = visibility { return drag }
+        return nil
+    }
+
+    private func setDrag(_ drag: Drag?) {
+        if case .shown(let screen, _) = visibility { visibility = .shown(on: screen, drag: drag) }
+    }
 
     /// Called for every movement of a drag on the pill. The pointer is read in screen
     /// coordinates because the view's own coordinates move with the panel.
@@ -218,17 +243,17 @@ final class HUDPanel {
     func dragMoved() {
         let mouse = NSEvent.mouseLocation
         guard let current = drag else {
-            drag = Drag(mouse: mouse, origin: panel.frame.origin, edge: dock.edge)
+            setDrag(Drag(mouse: mouse, origin: panel.frame.origin, edge: dock.edge))
             return
         }
         let edge = Self.screen(containing: mouse).map { HUDDock(nearest: mouse, in: $0.visibleFrame).edge } ?? current.edge
         let before = layout
-        drag = Drag(mouse: current.mouse, origin: current.origin, edge: edge)
+        setDrag(Drag(mouse: current.mouse, origin: current.origin, edge: edge))
         let after = layout
         guard after == before else {
             let size = after.size
             let origin = NSPoint(x: mouse.x - size.width / 2, y: mouse.y - size.height / 2)
-            drag = Drag(mouse: mouse, origin: origin, edge: edge)
+            setDrag(Drag(mouse: mouse, origin: origin, edge: edge))
             chrome.layout = after
             panel.setFrame(NSRect(origin: origin, size: size), display: true)
             return
@@ -238,17 +263,16 @@ final class HUDPanel {
 
     func dragEnded() {
         guard drag != nil else { return }
-        drag = nil
         let mouse = NSEvent.mouseLocation
         let screen = Self.screen(containing: mouse)
-        visibility = .shown(on: screen)
+        visibility = .shown(on: screen, drag: nil)
         if let area = screen?.visibleFrame { dock = HUDDock(nearest: mouse, in: area) }
         relayout(animated: true)
     }
 
     // MARK: Layout
 
-    private static func stage(of phase: Phase) -> Stage {
+    private static func stageKind(of phase: Phase) -> StageKind {
         switch phase {
         case .idle, .pickingSource: return .absent
         case .starting, .countingDown, .recording: return .live
@@ -257,20 +281,25 @@ final class HUDPanel {
     }
 
     private var layout: HUDLayout {
-        switch presence {
-        case .tucked:
-            return .marker
-        case .shown:
-            switch (stage, drag?.edge ?? dock.edge) {
-            case (.live, .left), (.live, .right): return .pill(.vertical)
-            case (.live, .bottom), (.report, _), (.absent, _): return .pill(.horizontal)
+        switch stage {
+        case .absent, .report:
+            return .pill(.horizontal)
+        case .live(let live):
+            switch live.presence {
+            case .tucked:
+                return .marker
+            case .shown:
+                switch drag?.edge ?? dock.edge {
+                case .left, .right: return .pill(.vertical)
+                case .bottom: return .pill(.horizontal)
+                }
             }
         }
     }
 
     private func show() {
         if case .hidden = visibility {
-            visibility = .shown(on: Self.screen(containing: NSEvent.mouseLocation))
+            visibility = .shown(on: Self.screen(containing: NSEvent.mouseLocation), drag: nil)
         }
         relayout(animated: false)
         NSAnimationContext.runAnimationGroup { context in
@@ -283,7 +312,6 @@ final class HUDPanel {
     private func hide() {
         guard case .shown = visibility else { return }
         visibility = .hidden
-        drag = nil
         let panel = panel
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = Self.fadeOut
@@ -302,7 +330,7 @@ final class HUDPanel {
     private func relayout(animated: Bool) {
         let layout = layout
         if chrome.layout != layout { chrome.layout = layout }
-        guard drag == nil, case .shown(let screen) = visibility, let area = screen?.visibleFrame else { return }
+        guard drag == nil, case .shown(let screen, _) = visibility, let area = screen?.visibleFrame else { return }
         let frame = Self.frame(for: layout, docked: dock, in: area)
         if panel.frame != frame { panel.setFrame(frame, display: true, animate: animated) }
     }

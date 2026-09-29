@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Compile and run the GIF stream checks (Tests/GIFStreamChecks). They need only the
-# Command Line Tools, unlike `swift test`, which needs Xcode for XCTest.
+# Compile and run the checks in Tests/GIFStreamChecks: the GIF stream, the frame
+# diff, and the file-name types. They need only the Command Line Tools, unlike
+# `swift test`, which needs Xcode for XCTest.
 #
 #   ./Scripts/check-gif-stream.sh
 
@@ -11,8 +12,9 @@ WORK="$(mktemp -d)"
 trap 'chmod -R u+w "$WORK"; rm -rf "$WORK"' EXIT
 
 swiftc -o "$WORK/checks" \
+    "$ROOT/Sources/Screensnap/Geometry.swift" \
     "$ROOT/Sources/Screensnap/GIFStream.swift" \
     "$ROOT/Sources/Screensnap/FrameDiff.swift" \
-    "$ROOT/Sources/Screensnap/Output.swift" \
+    "$ROOT/Sources/Screensnap/FilenameTemplate.swift" \
     "$ROOT/Tests/GIFStreamChecks/main.swift"
 "$WORK/checks" "$WORK"

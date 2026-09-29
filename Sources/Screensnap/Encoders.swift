@@ -5,13 +5,55 @@ import ImageIO
 import UniformTypeIdentifiers
 import os
 
-/// A streaming frame encoder. Frames arrive one at a time and the encoder
-/// is finalized at the end. Encoders own their own scratch state.
+/// A streaming frame encoder. Frames arrive one at a time; then exactly one of
+/// `finish` or `cancel` closes it, after which frames are ignored. `finish` on a
+/// closed encoder throws; `cancel` on one is a no-op. Every implementation keeps
+/// that sequence with an `EncoderLifecycle`. Encoders own their own scratch state.
 @MainActor
 protocol FrameEncoder: AnyObject {
     func append(_ frame: CapturedFrame) throws
-    func finish() async throws -> FinishedEncoding
+    /// `end` is the recording's length on the recorder's clock, pauses excluded: the
+    /// moment the last frame stops showing.
+    func finish(at end: CFTimeInterval) async throws -> FinishedEncoding
     func cancel()
+}
+
+/// Where an encoder is in the one sequence `FrameEncoder` allows.
+enum EncoderLifecycle: Equatable {
+    case open
+    case finished
+    case cancelled
+
+    var acceptsFrames: Bool { self == .open }
+
+    mutating func finish() throws {
+        switch self {
+        case .open: self = .finished
+        case .finished: throw EncoderError.alreadyFinished
+        case .cancelled: throw EncoderError.alreadyCancelled
+        }
+    }
+
+    /// Whether there was anything to cancel.
+    mutating func cancel() -> Bool {
+        guard case .open = self else { return false }
+        self = .cancelled
+        return true
+    }
+}
+
+enum EncoderError: LocalizedError {
+    case alreadyFinished
+    case alreadyCancelled
+    case noFrames
+
+    var errorDescription: String? {
+        switch self {
+        case .alreadyFinished: return "The recording was already finished."
+        case .alreadyCancelled: return "The recording was already discarded."
+        case .noFrames: return "No frames were captured."
+        }
+    }
 }
 
 /// The file on disk, and the quality step it lost on the way when the encoder had
@@ -21,19 +63,59 @@ struct FinishedEncoding {
     let degradation: Degradation?
 }
 
-/// The encoder for an `Output`, plus the audio channel when the output records one.
+/// Whether the external gifski encoder can be run, decided before a recording starts
+/// so a missing binary costs a quality step rather than the recording.
+enum GifskiAvailability: Equatable {
+    case located(URL)
+    case missing
+
+    /// (1) the app bundle's Resources, (2) the usual Homebrew paths.
+    static func locate() -> GifskiAvailability {
+        if let bundled = Bundle.main.url(forResource: "gifski", withExtension: nil) {
+            return .located(bundled)
+        }
+        let candidates = [
+            "/opt/homebrew/bin/gifski",
+            "/usr/local/bin/gifski",
+            "/usr/bin/gifski",
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return .located(URL(fileURLWithPath: path))
+        }
+        return .missing
+    }
+}
+
+/// The encoder a recording will run, settled before the first frame: gifski only with
+/// the binary in hand, a voice track only with a microphone delivering. `output` is
+/// what the choice produces, for the file extension and every label.
+enum EncoderChoice: Equatable {
+    case imageIOGif
+    case gifski(URL)
+    case mp4(AudioTrack)
+
+    var output: Output {
+        switch self {
+        case .imageIOGif: return .gif(.fast)
+        case .gifski: return .gif(.best)
+        case .mp4(let audio): return .mp4(audio)
+        }
+    }
+}
+
+/// The encoder for a choice, plus the audio channel when the output records one.
 struct EncoderSetup {
     let encoder: FrameEncoder
     let audioChannel: AudioWriterChannel?
 
     @MainActor
-    static func make(output: Output, url: URL, framerate: Int, pixelSize: CGSize, audio: AudioTrack) throws -> EncoderSetup {
-        switch output {
-        case .gif(.fast):
+    static func make(_ choice: EncoderChoice, url: URL, framerate: Framerate, pixelSize: Dimensions) throws -> EncoderSetup {
+        switch choice {
+        case .imageIOGif:
             return EncoderSetup(encoder: try ImageIOGifEncoder(outputURL: url), audioChannel: nil)
-        case .gif(.best):
-            return EncoderSetup(encoder: try GifskiEncoder(outputURL: url, framerate: framerate, quality: GifskiEncoder.defaultQuality), audioChannel: nil)
-        case .mp4:
+        case .gifski(let gifski):
+            return EncoderSetup(encoder: try GifskiEncoder(gifski: gifski, outputURL: url, framerate: framerate, quality: GifskiEncoder.defaultQuality), audioChannel: nil)
+        case .mp4(let audio):
             let encoder = try MP4Encoder(outputURL: url, framerate: framerate, pixelSize: pixelSize, audio: audio)
             return EncoderSetup(encoder: encoder, audioChannel: encoder.audioChannel)
         }
@@ -81,18 +163,11 @@ final class ImageIOGifEncoder: FrameEncoder {
         }
     }
 
-    private enum EncoderState {
-        case waitingForFirstFrame
-        /// `startHostTime` is the host-clock moment the recording's timeline starts.
-        case recording(startHostTime: CFTimeInterval)
-        case closed
-    }
-
     private let outputURL: URL
     private let stream: QueueConfined<GIFFrameStream>
     private let encodeQueue = DispatchQueue(label: "Screensnap.gifEncode", qos: .userInitiated, autoreleaseFrequency: .workItem)
     private let intake = OSAllocatedUnfairLock(initialState: Intake.accepting(backlog: 0))
-    private var state: EncoderState = .waitingForFirstFrame
+    private var lifecycle = EncoderLifecycle.open
 
     init(outputURL: URL) throws {
         self.outputURL = outputURL
@@ -102,11 +177,7 @@ final class ImageIOGifEncoder: FrameEncoder {
     /// Throws the error of an earlier frame that failed to encode, so the recording
     /// stops instead of capturing into a broken file.
     func append(_ frame: CapturedFrame) throws {
-        switch state {
-        case .closed: return
-        case .waitingForFirstFrame: state = .recording(startHostTime: frame.hostTime - frame.timestamp)
-        case .recording: break
-        }
+        guard lifecycle.acceptsFrames else { return }
         switch try intake.withLock({ try $0.admit() }) {
         case .dropped: return
         case .queued: break
@@ -117,16 +188,10 @@ final class ImageIOGifEncoder: FrameEncoder {
         }
     }
 
-    /// The GIF lasts until now. ScreenCaptureKit only delivers frames when the screen
-    /// changes, so the last frame received stays on screen up to the moment of stopping.
-    func finish() async throws -> FinishedEncoding {
-        let end: CFTimeInterval
-        switch state {
-        case .closed: throw GIFStreamError.closed
-        case .waitingForFirstFrame: end = 0
-        case .recording(let startHostTime): end = CACurrentMediaTime() - startHostTime
-        }
-        state = .closed
+    /// ScreenCaptureKit only delivers frames when the screen changes, so the last
+    /// frame received stays up until `end`, the moment the recorder stopped.
+    func finish(at end: CFTimeInterval) async throws -> FinishedEncoding {
+        try lifecycle.finish()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             encodeQueue.async { [stream] in
                 continuation.resume(with: Result { try stream.value.finish(at: end) })
@@ -136,7 +201,7 @@ final class ImageIOGifEncoder: FrameEncoder {
     }
 
     func cancel() {
-        state = .closed
+        guard lifecycle.cancel() else { return }
         encodeQueue.async { [stream] in stream.value.abandon() }
     }
 }
@@ -161,21 +226,18 @@ final class GifskiEncoder: FrameEncoder {
     static let defaultQuality = 80
 
     private let outputURL: URL
-    private let framerate: Int
+    private let framerate: Framerate
     private let quality: Int
     private let gifskiURL: URL
     private let tempDir: URL
     private var frames: [SavedFrame] = []
     private let encodeQueue = DispatchQueue(label: "Screensnap.gifskiEncode", qos: .userInitiated)
-    private var isCancelled = false
+    private var lifecycle = EncoderLifecycle.open
 
-    init(outputURL: URL, framerate: Int, quality: Int) throws {
-        guard let gifskiURL = Self.locateGifski() else {
-            throw NSError(domain: "Screensnap", code: 6, userInfo: [
-                NSLocalizedDescriptionKey: "gifski is not installed. `brew install gifski`, or pick GIF (fast)."
-            ])
-        }
-        self.gifskiURL = gifskiURL
+    /// `gifski` is the located binary; whether one exists was decided by whoever
+    /// chose this encoder.
+    init(gifski: URL, outputURL: URL, framerate: Framerate, quality: Int) throws {
+        self.gifskiURL = gifski
         self.outputURL = outputURL
         self.framerate = framerate
         self.quality = quality
@@ -190,7 +252,7 @@ final class GifskiEncoder: FrameEncoder {
     }
 
     func append(_ frame: CapturedFrame) throws {
-        guard !isCancelled else { return }
+        guard lifecycle.acceptsFrames else { return }
         let saved = SavedFrame(
             file: tempDir.appendingPathComponent(String(format: "frame-%06d.png", frames.count)),
             timestamp: frame.timestamp
@@ -205,15 +267,15 @@ final class GifskiEncoder: FrameEncoder {
         }
     }
 
-    func finish() async throws -> FinishedEncoding {
+    func finish(at end: CFTimeInterval) async throws -> FinishedEncoding {
+        try lifecycle.finish()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             encodeQueue.async { continuation.resume() }
         }
         defer { try? FileManager.default.removeItem(at: tempDir) }
-        guard !isCancelled else { throw CancellationError() }
 
         // A frame whose PNG failed to write is skipped. gifski spaces the rest evenly
-        // by --fps; the fallback keeps each frame's own timestamp.
+        // by --fps; the fallback keeps each frame's own timestamp and the same end.
         let written = frames.filter { FileManager.default.fileExists(atPath: $0.file.path) }
 
         do {
@@ -221,7 +283,6 @@ final class GifskiEncoder: FrameEncoder {
             return FinishedEncoding(url: outputURL, degradation: nil)
         } catch {
             FileHandle.standardError.write(Data("[Screensnap] gifski failed, assembling with ImageIO: \(error.localizedDescription)\n".utf8))
-            let end = (written.last?.timestamp ?? 0) + 1.0 / Double(max(1, framerate))
             let outputURL = self.outputURL
             try await Task.detached(priority: .userInitiated) {
                 try Self.assembleWithImageIO(written, end: end, outputURL: outputURL)
@@ -238,7 +299,7 @@ final class GifskiEncoder: FrameEncoder {
     /// a bare filename rather than a temp path four times as long — roughly 36,000
     /// frames instead of 9,000. Past the ceiling it is not launched at all.
     private func runGifski(frames: [URL]) async throws {
-        let arguments = ["--fps", String(framerate), "--quality", String(quality), "-o", outputURL.path] + frames.map(\.lastPathComponent)
+        let arguments = ["--fps", String(framerate.fps), "--quality", String(quality), "-o", outputURL.path] + frames.map(\.lastPathComponent)
         guard Self.argvBytes(arguments) <= Self.argvBudget else { throw GifskiError.tooManyFrames(frames.count) }
 
         let process = Process()
@@ -288,25 +349,9 @@ final class GifskiEncoder: FrameEncoder {
     }
 
     func cancel() {
-        isCancelled = true
+        guard lifecycle.cancel() else { return }
         try? FileManager.default.removeItem(at: tempDir)
         try? FileManager.default.removeItem(at: outputURL)
-    }
-
-    /// Look for gifski in (1) the app bundle Resources dir, (2) common Homebrew paths.
-    static func locateGifski() -> URL? {
-        if let bundled = Bundle.main.url(forResource: "gifski", withExtension: nil) {
-            return bundled
-        }
-        let candidates = [
-            "/opt/homebrew/bin/gifski",
-            "/usr/local/bin/gifski",
-            "/usr/bin/gifski",
-        ]
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        return nil
     }
 }
 
@@ -330,11 +375,15 @@ enum GifskiError: LocalizedError {
 /// inputs; the lock only serializes appends against lifecycle transitions
 /// (activation and finish), since appending to a finished input traps.
 final class AudioWriterChannel: @unchecked Sendable {
-    private struct State {
-        /// Host-clock time of the writer timeline's zero (the first video frame).
-        /// nil until video starts — audio arriving before that is dropped.
-        var hostZero: CFTimeInterval?
-        var isAccepting = true
+    /// Where the channel is on the writer's timeline. Buffers are taken only while
+    /// `live`; a pause or resume before the first video frame changes nothing,
+    /// because the timeline's zero is anchored to that frame when it comes.
+    private enum State {
+        case waitingForVideo
+        /// `hostZero` is the host-clock time of the writer timeline's zero.
+        case live(hostZero: CFTimeInterval)
+        case paused(hostZero: CFTimeInterval)
+        case closed
     }
 
     private let input: AVAssetWriterInput
@@ -342,18 +391,20 @@ final class AudioWriterChannel: @unchecked Sendable {
 
     init(input: AVAssetWriterInput) {
         self.input = input
-        self.state = OSAllocatedUnfairLock(initialState: State())
+        self.state = OSAllocatedUnfairLock(initialState: .waitingForVideo)
     }
 
     /// Called once the writer session has started; anchors the audio timeline.
     func activate(hostZero: CFTimeInterval) {
-        state.withLock { $0.hostZero = $0.hostZero ?? hostZero }
+        state.withLock { s in
+            if case .waitingForVideo = s { s = .live(hostZero: hostZero) }
+        }
     }
 
     /// Rebases the buffer's host-clock PTS onto the writer timeline and appends.
     func append(_ buffer: CMSampleBuffer) {
         state.withLockUnchecked { s in
-            guard s.isAccepting, let hostZero = s.hostZero, input.isReadyForMoreMediaData else { return }
+            guard case .live(let hostZero) = s, input.isReadyForMoreMediaData else { return }
             let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
             let shifted = CMTimeSubtract(pts, CMTime(seconds: hostZero, preferredTimescale: pts.timescale))
             guard shifted >= .zero else { return } // audio from before the first video frame
@@ -365,25 +416,27 @@ final class AudioWriterChannel: @unchecked Sendable {
     /// While paused, buffers are dropped. Resuming shifts the timeline zero by the
     /// pause so the audio after it lines up with the video after it.
     func pause() {
-        state.withLock { $0.isAccepting = false }
+        state.withLock { s in
+            if case .live(let hostZero) = s { s = .paused(hostZero: hostZero) }
+        }
     }
 
     func resume(pausedFor: CFTimeInterval) {
         state.withLock { s in
-            s.hostZero = s.hostZero.map { $0 + pausedFor }
-            s.isAccepting = true
+            if case .paused(let hostZero) = s { s = .live(hostZero: hostZero + pausedFor) }
         }
     }
 
     /// Stop accepting buffers without touching the input (for cancelWriting,
     /// where marking the input finished is invalid).
     func stopAccepting() {
-        state.withLock { $0.isAccepting = false }
+        state.withLock { $0 = .closed }
     }
 
     func markFinished() {
         state.withLock { s in
-            s.isAccepting = false
+            if case .closed = s { return }
+            s = .closed
             input.markAsFinished()
         }
     }
@@ -408,28 +461,33 @@ final class AudioWriterChannel: @unchecked Sendable {
 
 @MainActor
 final class MP4Encoder: FrameEncoder {
+    /// The writer session starts with the first frame; its timestamp is the file's zero.
+    private enum Session {
+        case notStarted
+        case started(firstTimestamp: CFTimeInterval)
+    }
+
     private let outputURL: URL
-    private let framerate: Int
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
-    private var startTime: CFTimeInterval?
+    private var session = Session.notStarted
+    private var lifecycle = EncoderLifecycle.open
     /// Present iff the encoder was created with `audio: .microphone`.
     let audioChannel: AudioWriterChannel?
 
-    init(outputURL: URL, framerate: Int, pixelSize: CGSize, audio: AudioTrack) throws {
+    init(outputURL: URL, framerate: Framerate, pixelSize: Dimensions, audio: AudioTrack) throws {
         self.outputURL = outputURL
-        self.framerate = framerate
         try? FileManager.default.removeItem(at: outputURL)
         self.writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: Int(pixelSize.width),
-            AVVideoHeightKey: Int(pixelSize.height),
+            AVVideoWidthKey: pixelSize.width,
+            AVVideoHeightKey: pixelSize.height,
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: Self.averageBitRate(pixelSize: pixelSize, framerate: framerate),
-                AVVideoMaxKeyFrameIntervalKey: framerate * 2,
+                AVVideoMaxKeyFrameIntervalKey: framerate.fps * 2,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],
         ]
@@ -440,8 +498,8 @@ final class MP4Encoder: FrameEncoder {
 
         let attrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-            kCVPixelBufferWidthKey as String: Int(pixelSize.width),
-            kCVPixelBufferHeightKey as String: Int(pixelSize.height),
+            kCVPixelBufferWidthKey as String: pixelSize.width,
+            kCVPixelBufferHeightKey as String: pixelSize.height,
         ]
         self.adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: attrs)
 
@@ -475,19 +533,24 @@ final class MP4Encoder: FrameEncoder {
     /// flat colour and text — and ~18 Mbps for a Retina laptop screen at 30 fps.
     private static let bitsPerPixelPerFrame = 0.12
 
-    private static func averageBitRate(pixelSize: CGSize, framerate: Int) -> Int {
-        max(1_000_000, Int(pixelSize.width * pixelSize.height * Double(framerate) * bitsPerPixelPerFrame))
+    private static func averageBitRate(pixelSize: Dimensions, framerate: Framerate) -> Int {
+        max(1_000_000, Int(Double(pixelSize.width * pixelSize.height * framerate.fps) * bitsPerPixelPerFrame))
     }
 
     func append(_ frame: CapturedFrame) throws {
-        if startTime == nil {
-            startTime = frame.timestamp
+        guard lifecycle.acceptsFrames else { return }
+        let firstTimestamp: CFTimeInterval
+        switch session {
+        case .notStarted:
+            firstTimestamp = frame.timestamp
+            session = .started(firstTimestamp: firstTimestamp)
             writer.startWriting()
             writer.startSession(atSourceTime: .zero)
             audioChannel?.activate(hostZero: frame.hostTime)
+        case .started(let first):
+            firstTimestamp = first
         }
-        let elapsed = frame.timestamp - (startTime ?? frame.timestamp)
-        let pts = CMTime(seconds: elapsed, preferredTimescale: 600)
+        let pts = CMTime(seconds: frame.timestamp - firstTimestamp, preferredTimescale: 600)
 
         guard input.isReadyForMoreMediaData else { return } // drop if not ready
         guard let pool = adaptor.pixelBufferPool, let pixelBuffer = makePixelBuffer(from: frame.image, pool: pool) else {
@@ -496,7 +559,10 @@ final class MP4Encoder: FrameEncoder {
         adaptor.append(pixelBuffer, withPresentationTime: pts)
     }
 
-    func finish() async throws -> FinishedEncoding {
+    /// The last frame's own presentation time ends the file; `end` is not needed.
+    func finish(at end: CFTimeInterval) async throws -> FinishedEncoding {
+        try lifecycle.finish()
+        guard case .started = session else { throw EncoderError.noFrames }
         audioChannel?.markFinished()
         input.markAsFinished()
         let writer = self.writer
@@ -513,8 +579,9 @@ final class MP4Encoder: FrameEncoder {
     }
 
     func cancel() {
+        guard lifecycle.cancel() else { return }
         audioChannel?.stopAccepting()
-        writer.cancelWriting()
+        if case .started = session { writer.cancelWriting() }
         try? FileManager.default.removeItem(at: outputURL)
     }
 
