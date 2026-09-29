@@ -128,4 +128,11 @@ enum Clipboard {
             pasteboard.setData(data, forType: NSPasteboard.PasteboardType(UTType.gif.identifier))
         }
     }
+
+    /// The absolute path as plain text, for terminals and config files.
+    static func copyPath(of url: URL) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.path, forType: .string)
+    }
 }

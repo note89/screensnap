@@ -568,6 +568,9 @@ private struct RecordingRow: View {
     @State private var compressing = false
     @State private var message: String?
     @State private var thumbnailHovered = false
+    /// Swaps the copy-path icon for a checkmark for a moment, as the only sign it worked.
+    @State private var pathCopied = false
+    @FocusState private var nameFieldFocused: Bool
 
     private var library: RecordingsStore { coordinator.library }
     private var job: CompressionJob? { coordinator.compression?.recording == recording ? coordinator.compression : nil }
@@ -585,13 +588,36 @@ private struct RecordingRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 switch nameEdit {
                 case .renaming(let draft):
-                    TextField("Name", text: Binding(get: { draft }, set: { nameEdit = .renaming(draft: $0) }), onCommit: { commitRename(draft) })
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 260)
-                        .onExitCommand { nameEdit = .showing }
+                    HStack(spacing: 6) {
+                        TextField("Name", text: Binding(get: { draft }, set: { nameEdit = .renaming(draft: $0) }), onCommit: { commitRename(draft) })
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 260)
+                            .focused($nameFieldFocused)
+                            .onAppear { nameFieldFocused = true }
+                            .onExitCommand { nameEdit = .showing }
+                        iconButton("checkmark", help: "Save name (Return)") { commitRename(draft) }
+                            .foregroundStyle(.green)
+                        iconButton("xmark", help: "Cancel (Esc)") { nameEdit = .showing }
+                            .foregroundStyle(.secondary)
+                    }
                 case .showing:
-                    Text(recording.name).fontWeight(.medium).lineLimit(1)
-                        .onTapGesture(count: 2) { nameEdit = .renaming(draft: recording.name) }
+                    HStack(spacing: 6) {
+                        Text(recording.name).fontWeight(.medium).lineLimit(1)
+                            .contentShape(Rectangle())
+                            .onTapGesture(perform: startRename)
+                            .help("Click to rename")
+                        iconButton(pathCopied ? "checkmark" : "link", help: "Copy absolute path") {
+                            Clipboard.copyPath(of: recording.url)
+                            pathCopied = true
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .task(id: pathCopied) {
+                            guard pathCopied else { return }
+                            try? await Task.sleep(for: .seconds(1.5))
+                            pathCopied = false
+                        }
+                    }
                 }
                 Text(meta).font(.caption).foregroundStyle(.secondary)
                 if let job {
@@ -602,17 +628,17 @@ private struct RecordingRow: View {
                 }
             }
             Spacer()
-            HStack(spacing: 4) {
+            HStack(spacing: 7) {
                 iconButton("play.fill", help: "Play") { library.play(recording) }
                 iconButton("doc.on.doc", help: "Copy — ⌘V pastes it") { Clipboard.copy(recording.url) }
                 iconButton("magnifyingglass", help: "Show in Finder") { library.reveal(recording) }
                 Button {
                     compressing = true
                 } label: {
-                    Image(systemName: "rectangle.compress.vertical")
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
                 }
                 .buttonStyle(.plain)
-                .help("Compress…")
+                .help("Make smaller…")
                 .disabled(coordinator.compression != nil)
                 .popover(isPresented: $compressing, arrowEdge: .bottom) {
                     CompressPopover(recording: recording, info: library.info(for: recording)) { target, placement in
@@ -664,6 +690,10 @@ private struct RecordingRow: View {
         Button(action: action) { Image(systemName: symbol) }
             .buttonStyle(.plain)
             .help(help)
+    }
+
+    private func startRename() {
+        nameEdit = .renaming(draft: recording.name)
     }
 
     private func commitRename(_ draft: String) {
