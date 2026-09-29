@@ -601,10 +601,10 @@ private struct RecordingRow: View {
                             .frame(maxWidth: 260)
                             .focused($nameFieldFocused)
                             .onAppear { nameFieldFocused = true }
-                            .onExitCommand { nameEdit = .showing }
+                            .onExitCommand(perform: cancelRename)
                         iconButton("checkmark", help: "Save name (Return)") { commitRename(draft) }
                             .foregroundStyle(.green)
-                        iconButton("xmark", help: "Cancel (Esc)") { nameEdit = .showing }
+                        iconButton("xmark", help: "Cancel (Esc)", action: cancelRename)
                             .foregroundStyle(.secondary)
                     }
                 case .showing:
@@ -701,6 +701,11 @@ private struct RecordingRow: View {
 
     private func startRename() {
         nameEdit = .renaming(draft: recording.name)
+    }
+
+    private func cancelRename() {
+        nameEdit = .showing
+        message = nil
     }
 
     /// A refused name keeps the field open with the draft, so it can be corrected.
