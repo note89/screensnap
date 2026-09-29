@@ -73,14 +73,18 @@ struct MenuView: View {
         switch coordinator.phase {
         case .idle:
             switch coordinator.screenRecordingAccess {
-            case .granted: return "⌘⇧. records \(coordinator.settings.captureMode.label.lowercased())"
+            case .granted:
+                guard let keys = coordinator.hotkey.advertisedKeys else { return "\(HotkeyRegistration.keys) unavailable — record from this menu" }
+                return "\(keys) records \(coordinator.settings.captureMode.label.lowercased())"
             case .grantedSinceLaunch: return "Screen Recording granted — relaunch to activate"
             case .missing: return "Screen Recording permission missing"
             }
         case .pickingSource(let mode): return "choosing \(mode.label.lowercased())…"
         case .starting(let output): return "starting \(output.label)…"
         case .countingDown(let remaining, _): return "recording in \(remaining)…"
-        case .recording(let run): return "recording \(run.output.label) — ⌘⇧. to finish"
+        case .recording(let run):
+            guard let keys = coordinator.hotkey.advertisedKeys else { return "recording \(run.output.label)" }
+            return "recording \(run.output.label) — \(keys) to finish"
         case .finishing(let step): return step.label
         case .settled(.saved(let recording, _)): return "saved \(recording.name) · \(recording.bytes.formatted)"
         case .settled(.discarded): return "discarded"

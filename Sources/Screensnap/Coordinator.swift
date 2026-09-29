@@ -46,6 +46,24 @@ private enum CountdownOutcome {
     let area: CGRect
 }
 
+/// ⌘⇧., the shortcut that records, cancels and finishes from any app. Carbon can
+/// refuse the registration; the surfaces that name the key then stop advertising it.
+enum HotkeyRegistration {
+    case pending
+    case active(GlobalHotkey)
+    case refused
+
+    static let keys = "⌘⇧."
+
+    /// The keys to advertise, or nil when pressing them would do nothing.
+    var advertisedKeys: String? {
+        switch self {
+        case .pending, .active: return Self.keys
+        case .refused: return nil
+        }
+    }
+}
+
 /// What the coordinator is doing, together with the things that exist only while
 /// doing it: the region overlay, the countdown timer, the recording session, and the
 /// timer that clears a settled message. Views see `phase`, its projection.
@@ -83,6 +101,7 @@ final class Coordinator: FrameSink {
     private(set) var micLevel: Float = 0
     private(set) var compression: CompressionJob?
     private(set) var permissions: PermissionReport
+    private(set) var hotkey: HotkeyRegistration = .pending
     /// Pane the settings window opens on; the menu sets it before opening the window.
     var settingsSection: SettingsSection = .capture
 
@@ -95,7 +114,6 @@ final class Coordinator: FrameSink {
     @ObservationIgnored private let countdownOverlay = CountdownOverlay()
     @ObservationIgnored private let grantPanel = GrantPanel()
     @ObservationIgnored private let permissionsAtLaunch: PermissionReport
-    @ObservationIgnored private var hotkey: GlobalHotkey?
 
     init() {
         permissionsAtLaunch = Permissions.check()
@@ -107,8 +125,11 @@ final class Coordinator: FrameSink {
 
     func start() {
         hud.attach(self)
-        hotkey = GlobalHotkey(keyCode: kVK_ANSI_Period, modifiers: cmdKey | shiftKey) { [weak self] in
-            self?.hotkeyPressed()
+        if let registered = GlobalHotkey(keyCode: kVK_ANSI_Period, modifiers: cmdKey | shiftKey, { [weak self] in self?.hotkeyPressed() }) {
+            hotkey = .active(registered)
+        } else {
+            hotkey = .refused
+            FileHandle.standardError.write(Data("[Screensnap] start: could not register \(HotkeyRegistration.keys)\n".utf8))
         }
         updater.checkIfDue(settings: settings)
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in

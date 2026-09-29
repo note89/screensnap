@@ -63,7 +63,7 @@ private struct Pill: View {
                 }
                 TuckButton(tuck: hud.togglePresence)
             case .recording(let run):
-                RecordingRow(run: run, axis: axis, micLevel: coordinator.micLevel, finish: coordinator.finish, togglePause: coordinator.togglePause, restart: coordinator.restart, discard: coordinator.discard)
+                RecordingRow(run: run, axis: axis, micLevel: coordinator.micLevel, finishKeys: coordinator.hotkey.advertisedKeys, finish: coordinator.finish, togglePause: coordinator.togglePause, restart: coordinator.restart, discard: coordinator.discard)
                 TuckButton(tuck: hud.togglePresence)
             case .finishing(let step):
                 ProgressView().controlSize(.small).tint(.white)
@@ -161,6 +161,8 @@ private struct RecordingRow: View {
     let run: RecordingRun
     let axis: Axis
     let micLevel: Float
+    /// nil when the global shortcut could not be registered.
+    let finishKeys: String?
     let finish: () -> Void
     let togglePause: () -> Void
     let restart: () -> Void
@@ -195,9 +197,9 @@ private struct RecordingRow: View {
         switch axis {
         case .horizontal:
             Spacer(minLength: 4)
-            PillButton(title: "Finish", role: .primary, action: finish).help("⌘⇧.")
+            PillButton(title: "Finish", role: .primary, action: finish).help(finishKeys ?? "Finish")
         case .vertical:
-            PillButton(systemImage: "stop.fill", role: .primary, action: finish).help("Finish (⌘⇧.)")
+            PillButton(systemImage: "stop.fill", role: .primary, action: finish).help(finishKeys.map { "Finish (\($0))" } ?? "Finish")
         }
         switch run.clock {
         case .running:

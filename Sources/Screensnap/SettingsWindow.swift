@@ -85,13 +85,20 @@ private struct CapturePane: View {
         self.settings = coordinator.settings
     }
 
+    private var shortcutSubtitle: String {
+        guard let keys = coordinator.hotkey.advertisedKeys else {
+            return "Pick what to record from the menu bar. \(HotkeyRegistration.keys) could not be registered, so start and finish from the menu bar too."
+        }
+        return "Pick what to record from the menu bar. \(keys) starts the last mode from anywhere, and finishes."
+    }
+
     private static let delays = [0, 3, 5, 10].map(StartDelay.init(clamping:))
     private static let gifFramerates = [10, 15, 24, 30].map(Framerate.init(clamping:))
     private static let mp4Framerates = [24, 30, 60].map(Framerate.init(clamping:))
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            PaneHeader(title: "Capture", subtitle: "Pick what to record from the menu bar. ⌘⇧. starts the last mode from anywhere, and finishes.")
+            PaneHeader(title: "Capture", subtitle: shortcutSubtitle)
 
             SectionLabel("WHAT")
             HStack(alignment: .top, spacing: 12) {
