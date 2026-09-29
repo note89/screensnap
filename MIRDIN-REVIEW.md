@@ -530,5 +530,5 @@ What each finding became in the tree that followed the review.
 | 14 | `requestInfo(for:)` / `requestThumbnail(for:)` for views, `loadInfo(for:)` for callers that wait. |
 | 15 | `Framerate` reaches every encoder; the re-clamp is gone. |
 | 16 | `Coordinator.quit(then:)` is the one entry; `PendingQuit.waitingForSave(then:)` carries the intent and `afterQuit` records the accepted one for the delegate. `Relaunch` only launches. `Updater.install()` reports an `InstallOutcome` and the coordinator relaunches. |
-| 17 | The pill sees a `HUDModel` protocol, not the coordinator. `Dimensions`, `PixelPoint` and `PixelRect` live in `Geometry.swift`; the check script lists it and CI runs the checks. A second SwiftPM target is still deferred. |
+| 17 | The pill sees a `HUDModel` protocol, not the coordinator. `Dimensions`, `PixelPoint` and `PixelRect` live in `Geometry.swift`; the check script compiles it and gains `FileStem` and `FilenameTemplate` checks. Running the checks in CI needs a workflow edit that was outside this change's permissions; a second SwiftPM target is still deferred. |
 | 18 | `FacecamOverlay` draws the bubble on the capture queue, reading `CameraCapture` and a `FacecamPlacementSource` the preview publishes to on every move. The main-actor hop remains only to hand the finished frame to the encoder, which is main-actor bound. |
