@@ -33,7 +33,15 @@
 
 ## Install
 
-### Download (recommended)
+### Homebrew (recommended)
+
+```bash
+brew install --cask note89/tap/screensnap
+```
+
+This installs the same signed, notarized build as the download below, plus [gifski](https://gif.ski) for **GIF · best**. Screensnap updates itself, so the cask is marked `auto_updates` and `brew upgrade` leaves it alone. Then start a recording from the menu bar icon and grant **Screen Recording** as in step 4 below.
+
+### Download
 
 1. Grab `Screensnap-x.y.z.zip` from the [latest release](https://github.com/note89/screensnap/releases/latest).
 2. Unzip it and drag **Screensnap.app** into your **Applications** folder.
@@ -196,10 +204,10 @@ Releases are built on the Mac that holds the Developer ID key, which never leave
 
 ```bash
 ./Scripts/release.sh 0.3.0            # build, sign, notarize, staple, zip — publishes nothing
-./Scripts/release.sh 0.3.0 --publish  # the same, then tag v0.3.0 and create the GitHub Release
+./Scripts/release.sh 0.3.0 --publish  # the same, then tag v0.3.0, create the GitHub Release, bump the cask
 ```
 
-The script stamps the version into `Info.plist`, signs `Screensnap.app` with the hardened runtime and a secure timestamp, has Apple notarize it, staples the ticket, zips it as `build/Screensnap-0.3.0.zip`, and with `--publish` tags the commit and uploads the zip with generated notes. Running apps pick it up on their next daily check. Tag pushes no longer build anything in CI, so a release cannot go out unsigned.
+The script stamps the version into `Info.plist`, signs `Screensnap.app` with the hardened runtime and a secure timestamp, has Apple notarize it, staples the ticket, zips it as `build/Screensnap-0.3.0.zip`, and with `--publish` tags the commit, uploads the zip with generated notes, and sets the new version and SHA-256 in [`note89/homebrew-tap`](https://github.com/note89/homebrew-tap)'s `Casks/screensnap.rb`. `--publish` checks up front that it can read that cask. Running apps pick it up on their next daily check. Tag pushes no longer build anything in CI, so a release cannot go out unsigned.
 
 ## License
 

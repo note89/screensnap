@@ -3,7 +3,8 @@
 # (with --publish) tag the release and attach the zip on GitHub.
 #
 #   ./Scripts/release.sh 0.3.0            # build, sign, notarize, zip; publish nothing
-#   ./Scripts/release.sh 0.3.0 --publish  # the same, then tag v0.3.0 and upload
+#   ./Scripts/release.sh 0.3.0 --publish  # the same, then tag v0.3.0, upload, and
+#                                         # bump the cask in note89/homebrew-tap
 #
 # Runs on the Mac that holds the Developer ID key; the key never leaves its keychain.
 # Needs the `devid-notary` notarytool keychain profile. The in-app updater only
@@ -14,6 +15,8 @@ set -euo pipefail
 TEAM_ID="43BT9GR95A"
 IDENTITY="${SCREENSNAP_SIGN_IDENTITY:-Developer ID Application: Nils Olof Tson Eriksson ($TEAM_ID)}"
 NOTARY_PROFILE="${SCREENSNAP_NOTARY_PROFILE:-devid-notary}"
+TAP_REPO="note89/homebrew-tap"
+CASK_PATH="Casks/screensnap.rb"
 
 VERSION="${1:-}"
 PUBLISH="${2:-}"
@@ -34,6 +37,8 @@ if [[ $PUBLISH == --publish ]]; then
     [[ -z $(git status --porcelain) ]] || die "working tree is not clean; commit first so the tag matches the build"
     git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
     command -v gh >/dev/null || die "gh is not installed"
+    # Checked before anything is published, so a release never goes out with no way to bump its cask.
+    gh api "repos/$TAP_REPO/contents/$CASK_PATH" --silent 2>/dev/null || die "cannot read $CASK_PATH in $TAP_REPO"
 fi
 
 step "Building"
@@ -86,3 +91,24 @@ step "Publishing $TAG"
 git tag -a "$TAG" -m "Screensnap $VERSION"
 git push origin "$TAG"
 gh release create "$TAG" "$ZIP" --title "Screensnap $VERSION" --generate-notes --verify-tag
+
+# The release is public from here on; if this step fails, the message says how to finish by hand.
+step "Bumping the Homebrew cask in $TAP_REPO"
+SHA="$(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
+TAP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TAP_DIR"' EXIT
+tap_die() { die "$* — set version \"$VERSION\" and sha256 \"$SHA\" in $TAP_REPO/$CASK_PATH by hand"; }
+gh repo clone "$TAP_REPO" "$TAP_DIR" -- --quiet --depth 1 || tap_die "could not clone $TAP_REPO"
+sed -i '' -E \
+    -e "s/^  version \"[^\"]*\"/  version \"$VERSION\"/" \
+    -e "s/^  sha256 \"[^\"]*\"/  sha256 \"$SHA\"/" \
+    "$TAP_DIR/$CASK_PATH"
+grep -qF "version \"$VERSION\"" "$TAP_DIR/$CASK_PATH" && grep -qF "sha256 \"$SHA\"" "$TAP_DIR/$CASK_PATH" \
+    || tap_die "the cask's version and sha256 lines did not match the expected layout"
+if git -C "$TAP_DIR" diff --quiet; then
+    echo "cask already at $VERSION"
+else
+    git -C "$TAP_DIR" commit --quiet --all --message "screensnap $VERSION"
+    git -C "$TAP_DIR" push --quiet origin HEAD || tap_die "could not push to $TAP_REPO"
+fi
+echo "✓ note89/tap/screensnap is at $VERSION"
