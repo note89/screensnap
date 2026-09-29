@@ -116,9 +116,12 @@ final class HUDPanel {
         case shown(on: NSScreen?)
     }
 
+    /// Where the pointer and panel were when the drag (or its last reshape) began,
+    /// and the edge the pill would snap to if dropped now.
     private struct Drag {
         let mouse: NSPoint
         let origin: NSPoint
+        let edge: HUDDock.Edge
     }
 
     let chrome = HUDChrome()
@@ -210,13 +213,27 @@ final class HUDPanel {
 
     /// Called for every movement of a drag on the pill. The pointer is read in screen
     /// coordinates because the view's own coordinates move with the panel.
+    /// Crossing into another edge's territory reshapes the pill on the spot, so it
+    /// already looks the way it will once dropped.
     func dragMoved() {
         let mouse = NSEvent.mouseLocation
-        guard let drag else {
-            drag = Drag(mouse: mouse, origin: panel.frame.origin)
+        guard let current = drag else {
+            drag = Drag(mouse: mouse, origin: panel.frame.origin, edge: dock.edge)
             return
         }
-        panel.setFrameOrigin(NSPoint(x: drag.origin.x + mouse.x - drag.mouse.x, y: drag.origin.y + mouse.y - drag.mouse.y))
+        let edge = Self.screen(containing: mouse).map { HUDDock(nearest: mouse, in: $0.visibleFrame).edge } ?? current.edge
+        let before = layout
+        drag = Drag(mouse: current.mouse, origin: current.origin, edge: edge)
+        let after = layout
+        guard after == before else {
+            let size = after.size
+            let origin = NSPoint(x: mouse.x - size.width / 2, y: mouse.y - size.height / 2)
+            drag = Drag(mouse: mouse, origin: origin, edge: edge)
+            chrome.layout = after
+            panel.setFrame(NSRect(origin: origin, size: size), display: true)
+            return
+        }
+        panel.setFrameOrigin(NSPoint(x: current.origin.x + mouse.x - current.mouse.x, y: current.origin.y + mouse.y - current.mouse.y))
     }
 
     func dragEnded() {
@@ -244,7 +261,7 @@ final class HUDPanel {
         case .tucked:
             return .marker
         case .shown:
-            switch (stage, dock.edge) {
+            switch (stage, drag?.edge ?? dock.edge) {
             case (.live, .left), (.live, .right): return .pill(.vertical)
             case (.live, .bottom), (.report, _), (.absent, _): return .pill(.horizontal)
             }
