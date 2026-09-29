@@ -10,10 +10,15 @@ import os
 @MainActor
 protocol FrameEncoder: AnyObject {
     func append(_ frame: CapturedFrame) throws
-    /// Returns the final URL (which may differ from a temp URL passed in earlier,
-    /// e.g. for the gifski path).
-    func finish() async throws -> URL
+    func finish() async throws -> FinishedEncoding
     func cancel()
+}
+
+/// The file on disk, and the quality step it lost on the way when the encoder had
+/// to fall back to a simpler one.
+struct FinishedEncoding {
+    let url: URL
+    let degradation: Degradation?
 }
 
 /// The encoder for an `Output`, plus the audio channel when the output records one.
@@ -114,7 +119,7 @@ final class ImageIOGifEncoder: FrameEncoder {
 
     /// The GIF lasts until now. ScreenCaptureKit only delivers frames when the screen
     /// changes, so the last frame received stays on screen up to the moment of stopping.
-    func finish() async throws -> URL {
+    func finish() async throws -> FinishedEncoding {
         let end: CFTimeInterval
         switch state {
         case .closed: throw GIFStreamError.closed
@@ -127,7 +132,7 @@ final class ImageIOGifEncoder: FrameEncoder {
                 continuation.resume(with: Result { try stream.value.finish(at: end) })
             }
         }
-        return outputURL
+        return FinishedEncoding(url: outputURL, degradation: nil)
     }
 
     func cancel() {
@@ -200,7 +205,7 @@ final class GifskiEncoder: FrameEncoder {
         }
     }
 
-    func finish() async throws -> URL {
+    func finish() async throws -> FinishedEncoding {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             encodeQueue.async { continuation.resume() }
         }
@@ -213,6 +218,7 @@ final class GifskiEncoder: FrameEncoder {
 
         do {
             try await runGifski(frames: written.map(\.file))
+            return FinishedEncoding(url: outputURL, degradation: nil)
         } catch {
             FileHandle.standardError.write(Data("[Screensnap] gifski failed, assembling with ImageIO: \(error.localizedDescription)\n".utf8))
             let end = (written.last?.timestamp ?? 0) + 1.0 / Double(max(1, framerate))
@@ -220,14 +226,25 @@ final class GifskiEncoder: FrameEncoder {
             try await Task.detached(priority: .userInitiated) {
                 try Self.assembleWithImageIO(written, end: end, outputURL: outputURL)
             }.value
+            switch error {
+            case GifskiError.tooManyFrames(let count): return FinishedEncoding(url: outputURL, degradation: .gifskiTooManyFrames(count))
+            default: return FinishedEncoding(url: outputURL, degradation: .gifskiFailed)
+            }
         }
-        return outputURL
     }
 
+    /// Every frame is its own argument, and the kernel caps argv plus the environment
+    /// at ARG_MAX (1 MiB). gifski runs inside the frame directory so each argument is
+    /// a bare filename rather than a temp path four times as long — roughly 36,000
+    /// frames instead of 9,000. Past the ceiling it is not launched at all.
     private func runGifski(frames: [URL]) async throws {
+        let arguments = ["--fps", String(framerate), "--quality", String(quality), "-o", outputURL.path] + frames.map(\.lastPathComponent)
+        guard Self.argvBytes(arguments) <= Self.argvBudget else { throw GifskiError.tooManyFrames(frames.count) }
+
         let process = Process()
         process.executableURL = gifskiURL
-        process.arguments = ["--fps", String(framerate), "--quality", String(quality), "-o", outputURL.path] + frames.map(\.path)
+        process.currentDirectoryURL = tempDir
+        process.arguments = arguments
         let stderr = Pipe()
         process.standardError = stderr
         try process.run()
@@ -239,12 +256,20 @@ final class GifskiEncoder: FrameEncoder {
                 } else {
                     let data = stderr.fileHandleForReading.readDataToEndOfFile()
                     let msg = String(data: data, encoding: .utf8) ?? "unknown error"
-                    continuation.resume(throwing: NSError(domain: "Screensnap", code: 7, userInfo: [
-                        NSLocalizedDescriptionKey: "gifski exited with status \(p.terminationStatus): \(msg)"
-                    ]))
+                    continuation.resume(throwing: GifskiError.exited(status: p.terminationStatus, stderr: msg))
                 }
             }
         }
+    }
+
+    /// ARG_MAX less room for the environment, which counts against the same limit.
+    private static let argvBudget = 900 * 1024
+
+    /// What `execve` charges for an argument vector: each string, its NUL, and its
+    /// pointer, with the executable path as argv[0].
+    private nonisolated static func argvBytes(_ arguments: [String]) -> Int {
+        let pointer = MemoryLayout<UnsafePointer<CChar>>.size
+        return (arguments + ["gifski"]).reduce(0) { $0 + $1.utf8.count + 1 + pointer }
     }
 
     private nonisolated static func assembleWithImageIO(_ frames: [SavedFrame], end: CFTimeInterval, outputURL: URL) throws {
@@ -282,6 +307,18 @@ final class GifskiEncoder: FrameEncoder {
             return URL(fileURLWithPath: path)
         }
         return nil
+    }
+}
+
+enum GifskiError: LocalizedError {
+    case tooManyFrames(Int)
+    case exited(status: Int32, stderr: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .tooManyFrames(let count): return "\(count) frames are more than one gifski command line can hold"
+        case .exited(let status, let stderr): return "gifski exited with status \(status): \(stderr)"
+        }
     }
 }
 
@@ -391,7 +428,7 @@ final class MP4Encoder: FrameEncoder {
             AVVideoWidthKey: Int(pixelSize.width),
             AVVideoHeightKey: Int(pixelSize.height),
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: max(1_000_000, Int(pixelSize.width * pixelSize.height) * 4),
+                AVVideoAverageBitRateKey: Self.averageBitRate(pixelSize: pixelSize, framerate: framerate),
                 AVVideoMaxKeyFrameIntervalKey: framerate * 2,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],
@@ -433,6 +470,15 @@ final class MP4Encoder: FrameEncoder {
         }
     }
 
+    /// Bits per pixel per frame, so the budget follows the framerate: 1 fps and 60 fps
+    /// used to get the same bits per second. 0.12 is generous for screen content —
+    /// flat colour and text — and ~18 Mbps for a Retina laptop screen at 30 fps.
+    private static let bitsPerPixelPerFrame = 0.12
+
+    private static func averageBitRate(pixelSize: CGSize, framerate: Int) -> Int {
+        max(1_000_000, Int(pixelSize.width * pixelSize.height * Double(framerate) * bitsPerPixelPerFrame))
+    }
+
     func append(_ frame: CapturedFrame) throws {
         if startTime == nil {
             startTime = frame.timestamp
@@ -450,7 +496,7 @@ final class MP4Encoder: FrameEncoder {
         adaptor.append(pixelBuffer, withPresentationTime: pts)
     }
 
-    func finish() async throws -> URL {
+    func finish() async throws -> FinishedEncoding {
         audioChannel?.markFinished()
         input.markAsFinished()
         let writer = self.writer
@@ -463,7 +509,7 @@ final class MP4Encoder: FrameEncoder {
                 }
             }
         }
-        return outputURL
+        return FinishedEncoding(url: outputURL, degradation: nil)
     }
 
     func cancel() {

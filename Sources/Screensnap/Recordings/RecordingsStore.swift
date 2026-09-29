@@ -112,10 +112,17 @@ final class RecordingsStore {
         rescan()
     }
 
+    /// A blank or unchanged name leaves the file alone. The file keeps its extension.
     func rename(_ recording: Recording, to stem: String) throws {
-        let cleaned = stem.replacingOccurrences(of: "/", with: "-").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty, cleaned != recording.name else { return }
-        let target = folder.appendingPathComponent(cleaned).appendingPathExtension(recording.url.pathExtension)
+        let name = stem.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != recording.name else { return }
+        if let character = name.first(where: FilenameTemplate.forbiddenCharacters.contains) { throw RenameError.forbidden(character) }
+        guard !name.hasPrefix(".") else { throw RenameError.startsWithDot }
+        let target = folder.appendingPathComponent(name).appendingPathExtension(recording.url.pathExtension)
+        // The volume is usually case-insensitive, so "clip" → "Clip" finds the file
+        // itself at the target; that rename is allowed.
+        let changesOnlyCase = name.caseInsensitiveCompare(recording.name) == .orderedSame
+        if !changesOnlyCase, FileManager.default.fileExists(atPath: target.path) { throw RenameError.taken(target.lastPathComponent) }
         try FileManager.default.moveItem(at: recording.url, to: target)
         rescan()
     }
@@ -143,6 +150,20 @@ final class RecordingsStore {
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
             self?.rescan()
+        }
+    }
+}
+
+enum RenameError: LocalizedError, Equatable {
+    case forbidden(Character)
+    case startsWithDot
+    case taken(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .forbidden(let character): return "File names cannot contain “\(character)”."
+        case .startsWithDot: return "A name starting with “.” would be hidden in Finder."
+        case .taken(let filename): return "“\(filename)” already exists in this folder."
         }
     }
 }

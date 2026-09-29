@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 
 /// A region the user has selected on a particular display.
@@ -13,10 +14,13 @@ struct SelectedRegion {
 /// Drag-to-select region overlay, modeled after macOS Cmd+Shift+5.
 ///
 /// The selector covers every connected display with a dimmed overlay window.
-/// On mouse-up it reports a `SelectedRegion`; on Escape (or Cmd-period) it cancels.
+/// On mouse-up it reports a `SelectedRegion`; on Escape it cancels.
 final class RegionSelector {
     private var overlays: [OverlayWindow] = []
     private var completion: ((SelectedRegion?) -> Void)?
+    /// Only one overlay can be key, so its own keyDown saw Escape on one display
+    /// only. The app is active while selecting, so a local monitor sees every key.
+    private var escapeMonitor: Any?
 
     func begin(completion: @escaping (SelectedRegion?) -> Void) {
         self.completion = completion
@@ -29,11 +33,21 @@ final class RegionSelector {
             overlay.orderFrontRegardless()
             overlays.append(overlay)
         }
-        // Promote first overlay to key so it gets keyboard events (Esc to cancel).
         overlays.first?.makeKey()
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, Int(event.keyCode) == kVK_Escape else { return event }
+            self.finish(with: nil)
+            return nil
+        }
+    }
+
+    func cancel() {
+        finish(with: nil)
     }
 
     fileprivate func finish(with region: SelectedRegion?) {
+        if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+        escapeMonitor = nil
         for overlay in overlays { overlay.orderOut(nil) }
         overlays.removeAll()
         let cb = completion
@@ -73,7 +87,6 @@ private final class OverlayWindow: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         contentView = selectionView
         selectionView.onCommit = { [weak self] rect in self?.commit(viewRect: rect) }
-        selectionView.onCancel = { [weak self] in self?.owner?.finish(with: nil) }
         acceptsMouseMovedEvents = true
         // Non-activating panels need this to receive mouse events properly.
         becomesKeyOnlyIfNeeded = false
@@ -111,6 +124,16 @@ extension NSScreen {
         screens.first { $0.displayID == displayID }
     }
 
+    /// The screen covering the largest part of `rect` (AppKit coordinates), or nil
+    /// when it is on none of them.
+    static func screen(mostlyShowing rect: CGRect) -> NSScreen? {
+        func overlap(_ screen: NSScreen) -> CGFloat {
+            let shared = screen.frame.intersection(rect)
+            return shared.isNull ? 0 : shared.width * shared.height
+        }
+        return screens.filter { overlap($0) > 0 }.max { overlap($0) < overlap($1) }
+    }
+
     var displayID: CGDirectDisplayID {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
             ?? CGMainDisplayID()
@@ -120,11 +143,28 @@ extension NSScreen {
 // MARK: - Selection view (handles drag + draws rectangle)
 
 private final class SelectionView: NSView {
+    /// What the overlay shows while no drag is under way.
+    private enum Hint {
+        case howTo
+        /// The last drag was smaller than `minimumSize` — taken as a slipped click.
+        case tooSmall
+
+        var text: String {
+            switch self {
+            case .howTo: return "Drag to select the area to record  ·  esc or ⌘⇧. to cancel"
+            case .tooSmall: return "Too small — drag a larger area  ·  esc or ⌘⇧. to cancel"
+            }
+        }
+    }
+
+    /// Anything smaller in either dimension, in points, is a slipped click.
+    private static let minimumSize: CGFloat = 10
+
     var onCommit: ((NSRect) -> Void)?
-    var onCancel: (() -> Void)?
 
     private var dragOrigin: NSPoint?
     private var dragCurrent: NSPoint?
+    private var hint = Hint.howTo
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -132,20 +172,6 @@ private final class SelectionView: NSView {
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .crosshair)
     }
-
-    // ── User contribution point #1 ──────────────────────────────────────────
-    // The drag handlers below are intentionally minimal. They commit any
-    // rectangle the user draws, even a 2x2 px misclick. There are real UX
-    // choices here that are worth your judgment:
-    //
-    //   • Minimum size: how small is "too small to record"? Reject? Snap up?
-    //   • Modifier keys: should holding Shift constrain to a square?
-    //   • Snap-to-edge: snap rectangle edges to screen edges within a few px?
-    //   • Live size readout: draw "320×200" near the rectangle while dragging?
-    //
-    // See the TODO inside `mouseUp` — that's where the commit logic lives.
-    // The other handlers (mouseDown, mouseDragged) are fine as-is for MVP.
-    // ────────────────────────────────────────────────────────────────────────
 
     override func mouseDown(with event: NSEvent) {
         dragOrigin = convert(event.locationInWindow, from: nil)
@@ -158,28 +184,25 @@ private final class SelectionView: NSView {
         needsDisplay = true
     }
 
+    /// A slipped click used to cancel the whole flow without a word. It now clears
+    /// the selection and stays up, saying why.
     override func mouseUp(with event: NSEvent) {
-        guard let rect = currentRect() else { onCancel?(); return }
-
-        // TODO(user): decide minimum-size policy. For now we reject anything
-        //             smaller than 10x10 points and commit the rest verbatim.
-        if rect.width < 10 || rect.height < 10 {
-            onCancel?()
+        guard let rect = currentRect() else { return }
+        guard rect.width >= Self.minimumSize, rect.height >= Self.minimumSize else {
+            dragOrigin = nil
+            dragCurrent = nil
+            hint = .tooSmall
+            needsDisplay = true
             return
         }
         onCommit?(rect)
     }
 
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 /* esc */ {
-            onCancel?()
-        } else {
-            super.keyDown(with: event)
-        }
-    }
-
     override func draw(_ dirtyRect: NSRect) {
-        guard let rect = currentRect() else { return }
+        guard let rect = currentRect() else {
+            drawHint()
+            return
+        }
         // Carve a hole in the dim overlay so the user sees what they're selecting.
         NSColor.clear.setFill()
         rect.fill(using: .copy)
@@ -190,6 +213,25 @@ private final class SelectionView: NSView {
         path.stroke()
         // Live dimensions.
         drawDimensions(in: rect)
+    }
+
+    private func drawHint() {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let text = hint.text as NSString
+        let size = text.size(withAttributes: attrs)
+        let pad: CGFloat = 12
+        let bgRect = NSRect(
+            x: bounds.midX - size.width / 2 - pad,
+            y: bounds.maxY - 120,
+            width: size.width + pad * 2,
+            height: size.height + pad
+        )
+        NSColor.black.withAlphaComponent(0.7).setFill()
+        NSBezierPath(roundedRect: bgRect, xRadius: 8, yRadius: 8).fill()
+        text.draw(at: NSPoint(x: bgRect.minX + pad, y: bgRect.minY + pad / 2), withAttributes: attrs)
     }
 
     private func drawDimensions(in rect: NSRect) {

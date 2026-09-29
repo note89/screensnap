@@ -6,12 +6,16 @@ enum Degradation: Equatable {
     case camera(String)
     case microphone(String)
     case gifskiMissing
+    case gifskiTooManyFrames(Int)
+    case gifskiFailed
 
     var message: String {
         switch self {
         case .camera(let reason): return "no facecam — \(reason)"
         case .microphone(let reason): return "no voice — \(reason)"
         case .gifskiMissing: return "gifski not installed — used the fast encoder"
+        case .gifskiTooManyFrames(let count): return "\(count.formatted()) frames is too long for gifski — used the fast encoder"
+        case .gifskiFailed: return "gifski failed — used the fast encoder"
         }
     }
 }

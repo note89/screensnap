@@ -85,13 +85,20 @@ private struct CapturePane: View {
         self.settings = coordinator.settings
     }
 
+    private var shortcutSubtitle: String {
+        guard let keys = coordinator.hotkey.advertisedKeys else {
+            return "Pick what to record from the menu bar. \(HotkeyRegistration.keys) could not be registered, so start and finish from the menu bar too."
+        }
+        return "Pick what to record from the menu bar. \(keys) starts the last mode from anywhere, and finishes."
+    }
+
     private static let delays = [0, 3, 5, 10].map(StartDelay.init(clamping:))
     private static let gifFramerates = [10, 15, 24, 30].map(Framerate.init(clamping:))
     private static let mp4Framerates = [24, 30, 60].map(Framerate.init(clamping:))
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            PaneHeader(title: "Capture", subtitle: "Pick what to record from the menu bar. ⌘⇧. starts the last mode from anywhere, and finishes.")
+            PaneHeader(title: "Capture", subtitle: shortcutSubtitle)
 
             SectionLabel("WHAT")
             HStack(alignment: .top, spacing: 12) {
@@ -594,10 +601,10 @@ private struct RecordingRow: View {
                             .frame(maxWidth: 260)
                             .focused($nameFieldFocused)
                             .onAppear { nameFieldFocused = true }
-                            .onExitCommand { nameEdit = .showing }
+                            .onExitCommand(perform: cancelRename)
                         iconButton("checkmark", help: "Save name (Return)") { commitRename(draft) }
                             .foregroundStyle(.green)
-                        iconButton("xmark", help: "Cancel (Esc)") { nameEdit = .showing }
+                        iconButton("xmark", help: "Cancel (Esc)", action: cancelRename)
                             .foregroundStyle(.secondary)
                     }
                 case .showing:
@@ -696,9 +703,20 @@ private struct RecordingRow: View {
         nameEdit = .renaming(draft: recording.name)
     }
 
-    private func commitRename(_ draft: String) {
+    private func cancelRename() {
         nameEdit = .showing
-        do { try library.rename(recording, to: draft) } catch { message = error.localizedDescription }
+        message = nil
+    }
+
+    /// A refused name keeps the field open with the draft, so it can be corrected.
+    private func commitRename(_ draft: String) {
+        do {
+            try library.rename(recording, to: draft)
+            nameEdit = .showing
+            message = nil
+        } catch {
+            message = error.localizedDescription
+        }
     }
 
     private func run(target: CompressionTarget, placement: CompressionPlacement) async {

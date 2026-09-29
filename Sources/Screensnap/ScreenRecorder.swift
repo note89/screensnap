@@ -34,14 +34,24 @@ enum CaptureSource {
         case .region(let r):
             size = r.pixelRect.size
         case .display(let d):
-            let scale = NSScreen.screen(displayID: d.displayID)?.backingScaleFactor ?? 2
+            let scale = screen?.backingScaleFactor ?? 2
             size = CGSize(width: CGFloat(d.width) * scale, height: CGFloat(d.height) * scale)
         case .window(let w):
-            let midPoint = CGPoint(x: w.frame.midX, y: w.frame.midY)
-            let scale = NSScreen.screens.first(where: { $0.frame.contains(midPoint) })?.backingScaleFactor ?? 2
+            let scale = screen?.backingScaleFactor ?? 2
             size = CGSize(width: w.frame.width * scale, height: w.frame.height * scale)
         }
         return CGSize(width: size.width.rounded(.down), height: size.height.rounded(.down))
+    }
+
+    /// The display the capture comes from. A window belongs to the one showing most
+    /// of it, compared in AppKit coordinates: `SCWindow.frame` is top-left origin and
+    /// `NSScreen.frame` bottom-left, and the two only agree on a single display.
+    var screen: NSScreen? {
+        switch self {
+        case .region(let r): return NSScreen.screen(displayID: r.displayID)
+        case .display(let d): return NSScreen.screen(displayID: d.displayID)
+        case .window: return NSScreen.screen(mostlyShowing: screenFrame)
+        }
     }
 
     /// Where the captured area sits on screen, in AppKit points (bottom-left origin).

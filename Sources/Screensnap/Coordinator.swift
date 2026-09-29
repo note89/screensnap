@@ -46,6 +46,40 @@ private enum CountdownOutcome {
     let area: CGRect
 }
 
+/// ⌘⇧., the shortcut that records, cancels and finishes from any app. Carbon can
+/// refuse the registration; the surfaces that name the key then stop advertising it.
+enum HotkeyRegistration {
+    case pending
+    case active(GlobalHotkey)
+    case refused
+
+    static let keys = "⌘⇧."
+
+    /// The keys to advertise, or nil when pressing them would do nothing.
+    var advertisedKeys: String? {
+        switch self {
+        case .pending, .active: return Self.keys
+        case .refused: return nil
+        }
+    }
+}
+
+/// What quitting now would cost.
+private enum QuitRisk {
+    case safe
+    /// Capturing: quitting would throw the recording away.
+    case losesRecording
+    /// Encoding, shrinking or compressing: quitting would cut a file off half-written,
+    /// or leave a replaced original in the Trash with its replacement lost.
+    case interruptsSave
+}
+
+/// A quit the app has accepted but not carried out, because a save is still running.
+private enum PendingQuit {
+    case notRequested
+    case waitingForSave
+}
+
 /// What the coordinator is doing, together with the things that exist only while
 /// doing it: the region overlay, the countdown timer, the recording session, and the
 /// timer that clears a settled message. Views see `phase`, its projection.
@@ -71,6 +105,15 @@ private enum CountdownOutcome {
         case .settled(let settlement, _): return .settled(settlement)
         }
     }
+
+    /// A countdown or picker has produced nothing yet, so quitting there loses nothing.
+    var quitRisk: QuitRisk {
+        switch self {
+        case .recording: return .losesRecording
+        case .finishing: return .interruptsSave
+        case .idle, .choosingRegion, .choosingSource, .starting, .countingDown, .settled: return .safe
+        }
+    }
 }
 
 @MainActor @Observable
@@ -83,6 +126,7 @@ final class Coordinator: FrameSink {
     private(set) var micLevel: Float = 0
     private(set) var compression: CompressionJob?
     private(set) var permissions: PermissionReport
+    private(set) var hotkey: HotkeyRegistration = .pending
     /// Pane the settings window opens on; the menu sets it before opening the window.
     var settingsSection: SettingsSection = .capture
 
@@ -95,7 +139,7 @@ final class Coordinator: FrameSink {
     @ObservationIgnored private let countdownOverlay = CountdownOverlay()
     @ObservationIgnored private let grantPanel = GrantPanel()
     @ObservationIgnored private let permissionsAtLaunch: PermissionReport
-    @ObservationIgnored private var hotkey: GlobalHotkey?
+    @ObservationIgnored private var pendingQuit = PendingQuit.notRequested
 
     init() {
         permissionsAtLaunch = Permissions.check()
@@ -107,8 +151,11 @@ final class Coordinator: FrameSink {
 
     func start() {
         hud.attach(self)
-        hotkey = GlobalHotkey(keyCode: kVK_ANSI_Period, modifiers: cmdKey | shiftKey) { [weak self] in
-            self?.hotkeyPressed()
+        if let registered = GlobalHotkey(keyCode: kVK_ANSI_Period, modifiers: cmdKey | shiftKey, { [weak self] in self?.hotkeyPressed() }) {
+            hotkey = .active(registered)
+        } else {
+            hotkey = .refused
+            FileHandle.standardError.write(Data("[Screensnap] start: could not register \(HotkeyRegistration.keys)\n".utf8))
         }
         updater.checkIfDue(settings: settings)
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
@@ -143,16 +190,83 @@ final class Coordinator: FrameSink {
         Task { _ = await Permissions.ensureMicrophoneAccess(); refreshPermissions() }
     }
 
+    // MARK: Quitting
+
+    /// The app delegate's answer to ⌘Q. A recording in progress is finished or
+    /// discarded first, as the user chooses; a save in progress is waited for.
+    /// `enter(_:)` releases the quit once nothing is left to lose.
+    func handleQuitRequest() -> NSApplication.TerminateReply {
+        // The first quit is still waiting; a second must not open a nested wait
+        // that the single reply cannot end.
+        if case .waitingForSave = pendingQuit { return .terminateCancel }
+        switch quitRisk {
+        case .safe:
+            return .terminateNow
+        case .interruptsSave:
+            pendingQuit = .waitingForSave
+            return .terminateLater
+        case .losesRecording:
+            guard let reason = askHowToEndRecording() else {
+                Relaunch.cancel()
+                return .terminateCancel
+            }
+            // The alert ran a modal loop, and ⌘⇧. or a failure may have ended the
+            // recording meanwhile.
+            guard case .recording = activity else { return handleQuitRequest() }
+            pendingQuit = .waitingForSave
+            Task { await stop(reason) }
+            return .terminateLater
+        }
+    }
+
+    /// A manual compression runs beside the recording flow, so it counts too.
+    private var quitRisk: QuitRisk {
+        switch activity.quitRisk {
+        case .losesRecording: return .losesRecording
+        case .interruptsSave: return .interruptsSave
+        case .safe: return compression == nil ? .safe : .interruptsSave
+        }
+    }
+
+    /// Called whenever something that can hold up a quit ends.
+    private func releasePendingQuitIfSafe() {
+        guard case .waitingForSave = pendingQuit, case .safe = quitRisk else { return }
+        pendingQuit = .notRequested
+        // A save that failed cancels the quit, so its message stays on screen.
+        if case .settled(.failed, _) = activity {
+            Relaunch.cancel()
+            NSApp.reply(toApplicationShouldTerminate: false)
+        } else {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+    }
+
+    private func askHowToEndRecording() -> StopReason? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "A recording is in progress"
+        alert.informativeText = "Finish and save it before quitting, or discard it?"
+        alert.addButton(withTitle: "Finish and Quit")
+        alert.addButton(withTitle: "Discard and Quit")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .finish
+        case .alertSecondButtonReturn: return .discard
+        default: return nil
+        }
+    }
+
     // MARK: Recording flow
 
-    /// ⌘⇧. means "do the next obvious thing": start with the last mode, cancel a
-    /// countdown, or finish a recording.
+    /// ⌘⇧. means "do the next obvious thing": start with the last mode, back out of
+    /// a region selection or a countdown, or finish a recording.
     private func hotkeyPressed() {
-        switch phase {
+        switch activity {
         case .idle, .settled: record(settings.captureMode)
+        case .choosingRegion(let selector): selector.cancel()
         case .countingDown: cancelCountdown()
         case .recording: finish()
-        case .pickingSource, .starting, .finishing: break
+        case .choosingSource, .starting, .finishing: break
         }
     }
 
@@ -369,23 +483,26 @@ final class Coordinator: FrameSink {
         guard case .recording(let session, let run) = activity else { return }
         switch reason {
         case .discard:
+            // Before settling, so the partial file is out of the save folder by the
+            // time a pending quit is released. The sink ignores frames that arrive after.
+            session.encoder.cancel()
             settle(.discarded)
             await session.recorder.stop()
             session.stopDevices()
-            session.encoder.cancel()
         case .restart:
+            session.encoder.cancel()
             enter(.starting(run.output))
             await session.recorder.stop()
             session.stopDevices()
-            session.encoder.cancel()
             await begin(source: session.source)
         case .finish:
             enter(.finishing(.encoding(run.output)))
             await session.recorder.stop()
             session.stopDevices()
             do {
-                let url = try await session.encoder.finish()
-                var notes = run.degradations.map(\.message)
+                let encoded = try await session.encoder.finish()
+                let url = encoded.url
+                var notes = (run.degradations + [encoded.degradation].compactMap { $0 }).map(\.message)
                 library.rescan()
                 guard var recording = library.recording(at: url) ?? Recording(url: url) else {
                     throw CompressionError.unreadable
@@ -427,10 +544,10 @@ final class Coordinator: FrameSink {
 
     private func abort(_ error: Error) async {
         guard case .recording(let session, _) = activity else { return }
+        session.encoder.cancel()
         settle(.failed(error.localizedDescription))
         await session.recorder.stop()
         session.stopDevices()
-        session.encoder.cancel()
     }
 
     private func settle(_ settlement: Settlement) {
@@ -466,6 +583,7 @@ final class Coordinator: FrameSink {
         }
         hud.render(phase)
         menuBar.render(phase)
+        releasePendingQuitIfSafe()
     }
 
     // MARK: FrameSink
@@ -513,7 +631,10 @@ final class Coordinator: FrameSink {
             return .failed(CompressionError.unreadable.localizedDescription)
         }
         compression = CompressionJob(recording: recording, target: target, progress: 0)
-        defer { compression = nil }
+        defer {
+            compression = nil
+            releasePendingQuitIfSafe()
+        }
         do {
             let result = try await Compressor.compress(recording, info: info, to: target, placement: placement) { [weak self] progress in
                 Task { @MainActor [weak self] in
