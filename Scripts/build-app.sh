@@ -34,6 +34,7 @@ cp "$ROOT/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 if [[ -f "$ROOT/Resources/gifski" ]]; then
     cp "$ROOT/Resources/gifski" "$APP_DIR/Contents/Resources/gifski"
     chmod +x "$APP_DIR/Contents/Resources/gifski"
+    cp "$ROOT/Resources/gifski-LICENSE.txt" "$APP_DIR/Contents/Resources/gifski-LICENSE.txt"
 fi
 
 # Sign with the Developer ID when this Mac has it, so local builds and releases

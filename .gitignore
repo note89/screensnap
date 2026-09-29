@@ -7,6 +7,9 @@ build/
 *.xcworkspace
 DerivedData/
 
+# Built by Scripts/build-gifski.sh
+Resources/gifski
+
 # Packaged artifacts
 *.zip
 *.dmg

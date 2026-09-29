@@ -39,7 +39,7 @@
 brew install --cask note89/tap/screensnap
 ```
 
-This installs the same signed, notarized build as the download below, plus [gifski](https://gif.ski) for **GIF · best**. Screensnap updates itself, so the cask is marked `auto_updates` and `brew upgrade` leaves it alone. Then start a recording from the menu bar icon and grant **Screen Recording** as in step 4 below.
+This installs the same signed, notarized build as the download below, with no dependencies. Screensnap updates itself, so the cask is marked `auto_updates` and `brew upgrade` leaves it alone. Then start a recording from the menu bar icon and grant **Screen Recording** as in step 4 below.
 
 ### Download
 
@@ -97,7 +97,7 @@ Open the app (menu bar → **Open Screensnap…**) and go to **Output**.
 | Format | Audio | Notes |
 |---|---|---|
 | **GIF** | no | Plays everywhere. Encoded by the built-in ImageIO encoder, ready in about a second. |
-| **GIF · best** | no | Same GIF, encoded by [gifski](https://gif.ski) for smoother colour and smaller files. Needs `brew install gifski`; the card says so if it is missing. |
+| **GIF · best** | no | Same GIF, encoded by [gifski](https://gif.ski) for smoother colour and smaller files. Releases bundle gifski; a build without it says so on the card. |
 | **MP4** | optional | H.264, roughly a tenth of the size of a GIF. The only format that can carry your voice. |
 
 **Size limit** is where Screensnap earns its keep. Choose a preset — 8 MB (Discord free), 25 MB (Gmail, Slack), 100 MB (Signal) — or type your own. A recording that lands over the limit is shrunk right after encoding (smaller frame first, then fewer frames) until it fits, and the pill reports the final size. If it cannot get under the limit it says so instead of guessing.
@@ -153,15 +153,13 @@ Screensnap checks GitHub Releases once a day. When a newer version exists the me
 
 If the app sits in a folder you cannot write to, the new build is placed in your Downloads folder instead and the About pane tells you.
 
-## Optional: gifski
+## gifski
 
-[gifski](https://gif.ski) produces noticeably better GIFs than the built-in encoder. Install it and choose **GIF · best**:
+[gifski](https://gif.ski) produces noticeably better GIFs than the built-in encoder, and **GIF · best** uses it. Releases carry it inside the app (`Contents/Resources/gifski`, about 1 MB), built by `Scripts/build-gifski.sh` from gifski 1.34.0 without its ffmpeg video feature, so it needs nothing else installed.
 
-```bash
-brew install gifski
-```
+For a build from source, run `./Scripts/build-gifski.sh` (needs [Rust](https://rustup.rs)) before `build-app.sh`, or `brew install gifski`; the app looks in the bundle first, then the usual Homebrew locations. If gifski is missing at recording time the app records with the built-in encoder and says so, rather than failing.
 
-Screensnap finds it in the usual Homebrew locations. To ship it inside the app instead, drop a `gifski` binary into `Resources/` before building. If gifski is missing at recording time the app records with the built-in encoder and says so, rather than failing.
+gifski is © Kornel Lesiński and licensed under the [AGPL-3.0](Resources/gifski-LICENSE.txt), separately from Screensnap's MIT licence; Screensnap runs it as its own program. Its source for the bundled version is at [ImageOptim/gifski@1.34.0](https://github.com/ImageOptim/gifski/tree/1.34.0).
 
 ## Project layout
 

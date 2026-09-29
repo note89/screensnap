@@ -41,8 +41,12 @@ if [[ $PUBLISH == --publish ]]; then
     gh api "repos/$TAP_REPO/contents/$CASK_PATH" --silent 2>/dev/null || die "cannot read $CASK_PATH in $TAP_REPO"
 fi
 
+step "Building gifski"
+Scripts/build-gifski.sh
+
 step "Building"
 SCREENSNAP_SIGN_IDENTITY="$IDENTITY" Scripts/build-app.sh release
+[[ -x "$APP/Contents/Resources/gifski" ]] || die "gifski is missing from the bundle; GIF · best would fall back to the fast encoder"
 
 step "Stamping version $VERSION"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
@@ -51,9 +55,7 @@ step "Stamping version $VERSION"
 # Stamping changed Info.plist, so sign again, this time with a secure timestamp,
 # which notarization requires. Nested code first, the bundle last.
 step "Signing with $IDENTITY"
-if [[ -f "$APP/Contents/Resources/gifski" ]]; then
-    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP/Contents/Resources/gifski"
-fi
+codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP/Contents/Resources/gifski"
 codesign --force --options runtime --timestamp --entitlements Resources/Screensnap.entitlements --sign "$IDENTITY" "$APP"
 codesign --verify --strict --deep --verbose=2 "$APP"
 
