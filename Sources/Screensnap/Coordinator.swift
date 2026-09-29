@@ -64,12 +64,13 @@ enum HotkeyRegistration {
     }
 }
 
-/// What quitting in the middle of an activity would cost.
+/// What quitting now would cost.
 private enum QuitRisk {
     case safe
     /// Capturing: quitting would throw the recording away.
     case losesRecording
-    /// Encoding or shrinking: quitting would cut the file off half-written.
+    /// Encoding, shrinking or compressing: quitting would cut a file off half-written,
+    /// or leave a replaced original in the Trash with its replacement lost.
     case interruptsSave
 }
 
@@ -195,20 +196,48 @@ final class Coordinator: FrameSink {
     /// discarded first, as the user chooses; a save in progress is waited for.
     /// `enter(_:)` releases the quit once nothing is left to lose.
     func handleQuitRequest() -> NSApplication.TerminateReply {
-        switch activity.quitRisk {
+        // The first quit is still waiting; a second must not open a nested wait
+        // that the single reply cannot end.
+        if case .waitingForSave = pendingQuit { return .terminateCancel }
+        switch quitRisk {
         case .safe:
             return .terminateNow
         case .interruptsSave:
             pendingQuit = .waitingForSave
             return .terminateLater
         case .losesRecording:
-            guard let reason = askHowToEndRecording() else { return .terminateCancel }
+            guard let reason = askHowToEndRecording() else {
+                Relaunch.cancel()
+                return .terminateCancel
+            }
             // The alert ran a modal loop, and ⌘⇧. or a failure may have ended the
             // recording meanwhile.
             guard case .recording = activity else { return handleQuitRequest() }
             pendingQuit = .waitingForSave
             Task { await stop(reason) }
             return .terminateLater
+        }
+    }
+
+    /// A manual compression runs beside the recording flow, so it counts too.
+    private var quitRisk: QuitRisk {
+        switch activity.quitRisk {
+        case .losesRecording: return .losesRecording
+        case .interruptsSave: return .interruptsSave
+        case .safe: return compression == nil ? .safe : .interruptsSave
+        }
+    }
+
+    /// Called whenever something that can hold up a quit ends.
+    private func releasePendingQuitIfSafe() {
+        guard case .waitingForSave = pendingQuit, case .safe = quitRisk else { return }
+        pendingQuit = .notRequested
+        // A save that failed cancels the quit, so its message stays on screen.
+        if case .settled(.failed, _) = activity {
+            Relaunch.cancel()
+            NSApp.reply(toApplicationShouldTerminate: false)
+        } else {
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
     }
 
@@ -454,8 +483,8 @@ final class Coordinator: FrameSink {
         guard case .recording(let session, let run) = activity else { return }
         switch reason {
         case .discard:
-            // Before settling, so the partial file is gone by the time a pending
-            // quit is released. The sink ignores frames that arrive after.
+            // Before settling, so the partial file is out of the save folder by the
+            // time a pending quit is released. The sink ignores frames that arrive after.
             session.encoder.cancel()
             settle(.discarded)
             await session.recorder.stop()
@@ -554,15 +583,7 @@ final class Coordinator: FrameSink {
         }
         hud.render(phase)
         menuBar.render(phase)
-        if case .waitingForSave = pendingQuit, case .safe = next.quitRisk {
-            pendingQuit = .notRequested
-            // A save that failed cancels the quit, so its message stays on screen.
-            if case .settled(.failed, _) = next {
-                NSApp.reply(toApplicationShouldTerminate: false)
-            } else {
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
-        }
+        releasePendingQuitIfSafe()
     }
 
     // MARK: FrameSink
@@ -610,7 +631,10 @@ final class Coordinator: FrameSink {
             return .failed(CompressionError.unreadable.localizedDescription)
         }
         compression = CompressionJob(recording: recording, target: target, progress: 0)
-        defer { compression = nil }
+        defer {
+            compression = nil
+            releasePendingQuitIfSafe()
+        }
         do {
             let result = try await Compressor.compress(recording, info: info, to: target, placement: placement) { [weak self] progress in
                 Task { @MainActor [weak self] in

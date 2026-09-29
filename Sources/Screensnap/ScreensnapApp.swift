@@ -35,6 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         coordinator.handleQuitRequest()
     }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        Relaunch.launchIfRequested()
+    }
 }
 
 /// Uncaught Obj-C exceptions and fatal signals leave a line in stderr before the
