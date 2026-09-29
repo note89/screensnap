@@ -696,9 +696,15 @@ private struct RecordingRow: View {
         nameEdit = .renaming(draft: recording.name)
     }
 
+    /// A refused name keeps the field open with the draft, so it can be corrected.
     private func commitRename(_ draft: String) {
-        nameEdit = .showing
-        do { try library.rename(recording, to: draft) } catch { message = error.localizedDescription }
+        do {
+            try library.rename(recording, to: draft)
+            nameEdit = .showing
+            message = nil
+        } catch {
+            message = error.localizedDescription
+        }
     }
 
     private func run(target: CompressionTarget, placement: CompressionPlacement) async {
