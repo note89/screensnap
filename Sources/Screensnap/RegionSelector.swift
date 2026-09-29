@@ -111,6 +111,16 @@ extension NSScreen {
         screens.first { $0.displayID == displayID }
     }
 
+    /// The screen covering the largest part of `rect` (AppKit coordinates), or nil
+    /// when it is on none of them.
+    static func screen(mostlyShowing rect: CGRect) -> NSScreen? {
+        func overlap(_ screen: NSScreen) -> CGFloat {
+            let shared = screen.frame.intersection(rect)
+            return shared.isNull ? 0 : shared.width * shared.height
+        }
+        return screens.filter { overlap($0) > 0 }.max { overlap($0) < overlap($1) }
+    }
+
     var displayID: CGDirectDisplayID {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
             ?? CGMainDisplayID()
