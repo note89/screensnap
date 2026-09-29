@@ -51,6 +51,7 @@ enum UpdateError: LocalizedError {
     case noZipAsset
     case unpackFailed(String)
     case noAppInArchive
+    case untrustedSignature
 
     var errorDescription: String? {
         switch self {
@@ -59,18 +60,21 @@ enum UpdateError: LocalizedError {
         case .noZipAsset: return "The latest release has no .zip to download."
         case .unpackFailed(let reason): return "Could not unpack the update: \(reason)"
         case .noAppInArchive: return "The downloaded archive holds no .app."
+        case .untrustedSignature: return "The download is not signed by Screensnap's developer, so it was not installed."
         }
     }
 }
 
 /// Checks GitHub Releases for a newer tag, downloads the zip, swaps the bundle in
-/// place and relaunches. Re-signs with the local dev certificate when one exists so
-/// TCC keeps treating the update as the same app.
+/// place and relaunches. Only builds signed with the team's Developer ID install;
+/// that same identity is what lets TCC keep treating the update as the same app.
 @MainActor @Observable
 final class Updater {
     static let repository = "note89/screensnap"
     static let checkInterval: TimeInterval = 24 * 60 * 60
-    static let localSigningIdentities = ["Screensnap Dev", "GifRecorder Dev"]
+    /// Apple-issued certificate belonging to this team: a Developer ID release, never
+    /// a download someone swapped on the way. Keep in step with Scripts/release.sh.
+    static let signingRequirement = #"anchor apple generic and certificate leaf[subject.OU] = "43BT9GR95A""#
 
     private(set) var state: UpdateState = .idle
     let currentVersion: SemanticVersion?
@@ -118,10 +122,7 @@ final class Updater {
 
             state = .installing(release)
             let newApp = try await Self.unpack(zipURL, into: workDir)
-            try await Self.clearQuarantine(newApp)
-            if let identity = await Self.availableSigningIdentity() {
-                try await Self.resign(newApp, identity: identity)
-            }
+            try await Self.verifySignature(newApp)
 
             let parent = bundleURL.deletingLastPathComponent()
             guard FileManager.default.isWritableFile(atPath: parent.path) else {
@@ -188,20 +189,10 @@ final class Updater {
         return app
     }
 
-    /// The user asked for this install; Gatekeeper's download flag would only block
-    /// the relaunch of an ad-hoc-signed build.
-    private static func clearQuarantine(_ app: URL) async throws {
-        _ = try await Shell.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
-    }
-
-    private static func availableSigningIdentity() async -> String? {
-        guard let result = try? await Shell.run("/usr/bin/security", ["find-identity", "-p", "codesigning"]) else { return nil }
-        return localSigningIdentities.first { result.output.contains("\"\($0)\"") }
-    }
-
-    private static func resign(_ app: URL, identity: String) async throws {
-        let result = try await Shell.run("/usr/bin/codesign", ["--force", "--deep", "--sign", identity, app.path])
-        guard result.status == 0 else { throw UpdateError.unpackFailed(result.output) }
+    /// The leading "=" makes codesign read the requirement as text, not a file path.
+    private static func verifySignature(_ app: URL) async throws {
+        let result = try await Shell.run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R=\(signingRequirement)", app.path])
+        guard result.status == 0 else { throw UpdateError.untrustedSignature }
     }
 
     private static func swap(current: URL, with replacement: URL, backupIn workDir: URL) throws {

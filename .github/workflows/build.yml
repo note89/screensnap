@@ -1,0 +1,16 @@
+name: Build
+
+# Releases are built, signed and notarized on the Mac that holds the Developer ID
+# key (Scripts/release.sh). CI only checks that the app still builds.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app bundle
+        run: Scripts/build-app.sh release
