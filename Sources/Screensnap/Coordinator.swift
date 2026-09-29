@@ -384,8 +384,9 @@ final class Coordinator: FrameSink {
             await session.recorder.stop()
             session.stopDevices()
             do {
-                let url = try await session.encoder.finish()
-                var notes = run.degradations.map(\.message)
+                let encoded = try await session.encoder.finish()
+                let url = encoded.url
+                var notes = (run.degradations + [encoded.degradation].compactMap { $0 }).map(\.message)
                 library.rescan()
                 guard var recording = library.recording(at: url) ?? Recording(url: url) else {
                     throw CompressionError.unreadable
