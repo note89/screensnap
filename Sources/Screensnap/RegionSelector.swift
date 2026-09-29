@@ -35,10 +35,14 @@ final class RegionSelector {
         }
         overlays.first?.makeKey()
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard Int(event.keyCode) == kVK_Escape else { return event }
-            self?.finish(with: nil)
+            guard let self, Int(event.keyCode) == kVK_Escape else { return event }
+            self.finish(with: nil)
             return nil
         }
+    }
+
+    func cancel() {
+        finish(with: nil)
     }
 
     fileprivate func finish(with region: SelectedRegion?) {
@@ -147,8 +151,8 @@ private final class SelectionView: NSView {
 
         var text: String {
             switch self {
-            case .howTo: return "Drag to select the area to record  ·  esc to cancel"
-            case .tooSmall: return "Too small — drag a larger area  ·  esc to cancel"
+            case .howTo: return "Drag to select the area to record  ·  esc or ⌘⇧. to cancel"
+            case .tooSmall: return "Too small — drag a larger area  ·  esc or ⌘⇧. to cancel"
             }
         }
     }

@@ -229,14 +229,15 @@ final class Coordinator: FrameSink {
 
     // MARK: Recording flow
 
-    /// ⌘⇧. means "do the next obvious thing": start with the last mode, cancel a
-    /// countdown, or finish a recording.
+    /// ⌘⇧. means "do the next obvious thing": start with the last mode, back out of
+    /// a region selection or a countdown, or finish a recording.
     private func hotkeyPressed() {
-        switch phase {
+        switch activity {
         case .idle, .settled: record(settings.captureMode)
+        case .choosingRegion(let selector): selector.cancel()
         case .countingDown: cancelCountdown()
         case .recording: finish()
-        case .pickingSource, .starting, .finishing: break
+        case .choosingSource, .starting, .finishing: break
         }
     }
 
