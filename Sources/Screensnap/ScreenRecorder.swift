@@ -197,7 +197,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Returns the recorded time so far, which the pill freezes on.
     func pause() -> CFTimeInterval {
-        clock.withLock { state in
+        clock.withLock { (state: inout FrameClock) -> CFTimeInterval in
             let now = CACurrentMediaTime()
             guard case .running(let startedAt, let lastEmitted) = state else { return state.elapsed(at: now) }
             state = .paused(startedAt: startedAt, lastEmitted: lastEmitted, since: now)
@@ -207,7 +207,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Returns how long the recording was paused, so audio can be shifted to match.
     func resume() -> CFTimeInterval {
-        clock.withLock { state in
+        clock.withLock { (state: inout FrameClock) -> CFTimeInterval in
             guard case .paused(let startedAt, let lastEmitted, let since) = state else { return 0 }
             let pausedFor = CACurrentMediaTime() - since
             state = .running(startedAt: startedAt + pausedFor, lastEmitted: lastEmitted)
@@ -218,7 +218,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Returns the recording's length on its clock, pauses excluded: the moment the
     /// encoder cuts the file at.
     func stop() async -> CFTimeInterval {
-        let end = clock.withLock { state in
+        let end = clock.withLock { (state: inout FrameClock) -> CFTimeInterval in
             let end = state.elapsed(at: CACurrentMediaTime())
             state = .stopped
             return end

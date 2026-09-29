@@ -230,7 +230,8 @@ final class Coordinator: FrameSink, HUDModel {
     func installUpdate() {
         Task { [weak self] in
             guard let self else { return }
-            if case .installed = await self.updater.install() { self.relaunch() }
+            let outcome = await self.updater.install()
+            if case .installed = outcome { self.relaunch() }
         }
     }
 
