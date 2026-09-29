@@ -325,6 +325,19 @@ final class AudioWriterChannel: @unchecked Sendable {
         }
     }
 
+    /// While paused, buffers are dropped. Resuming shifts the timeline zero by the
+    /// pause so the audio after it lines up with the video after it.
+    func pause() {
+        state.withLock { $0.isAccepting = false }
+    }
+
+    func resume(pausedFor: CFTimeInterval) {
+        state.withLock { s in
+            s.hostZero = s.hostZero.map { $0 + pausedFor }
+            s.isAccepting = true
+        }
+    }
+
     /// Stop accepting buffers without touching the input (for cancelWriting,
     /// where marking the input finished is invalid).
     func stopAccepting() {

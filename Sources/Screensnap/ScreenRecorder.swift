@@ -103,12 +103,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var captureState: CaptureState = .idle
     private let frameQueue = DispatchQueue(label: "Screensnap.frameQueue")
 
-    /// Frame pacing, shared with the capture queue. While `.stopped` every frame is
-    /// dropped; while `.running` at most one per frame interval passes. One value,
-    /// so "capturing but no start time" cannot be represented.
+    /// Frame pacing, shared with the capture queue. While `.stopped` or `.paused` every
+    /// frame is dropped; while `.running` at most one per frame interval passes. One
+    /// value, so "capturing but no start time" cannot be represented. Resuming moves
+    /// `startedAt` forward by the pause, so frame timestamps have no gap in them.
     private enum FrameClock {
         case stopped
         case running(startedAt: CFTimeInterval, lastEmitted: CFTimeInterval?)
+        case paused(startedAt: CFTimeInterval, lastEmitted: CFTimeInterval?, since: CFTimeInterval)
     }
     private let clock = OSAllocatedUnfairLock(initialState: FrameClock.stopped)
 
@@ -179,6 +181,23 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             return SCContentFilter(display: display, excludingWindows: excludedWindows)
         }
         return SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
+    }
+
+    func pause() {
+        clock.withLock { state in
+            guard case .running(let startedAt, let lastEmitted) = state else { return }
+            state = .paused(startedAt: startedAt, lastEmitted: lastEmitted, since: CACurrentMediaTime())
+        }
+    }
+
+    /// Returns how long the recording was paused, so audio can be shifted to match.
+    func resume() -> CFTimeInterval {
+        clock.withLock { state in
+            guard case .paused(let startedAt, let lastEmitted, let since) = state else { return 0 }
+            let pausedFor = CACurrentMediaTime() - since
+            state = .running(startedAt: startedAt + pausedFor, lastEmitted: lastEmitted)
+            return pausedFor
+        }
     }
 
     func stop() async {

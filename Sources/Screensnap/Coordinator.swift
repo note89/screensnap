@@ -21,6 +21,7 @@ enum CompressionOutcome: Equatable {
     let source: CaptureSource
     let recorder: ScreenRecorder
     let encoder: FrameEncoder
+    let audio: AudioWriterChannel?
     let camera: CameraCapture?
     let microphone: MicrophoneCapture?
     let preview: FacecamPreviewWindow?
@@ -41,6 +42,8 @@ private enum CountdownOutcome {
     let task: Task<CountdownOutcome, Never>
     var remaining: Int
     let output: Output
+    /// Screen rectangle about to be recorded; the big number is drawn over it.
+    let area: CGRect
 }
 
 /// What the coordinator is doing, together with the things that exist only while
@@ -89,6 +92,7 @@ final class Coordinator: FrameSink {
     let menuBar = MenuBarStatus()
 
     @ObservationIgnored private let hud = HUDPanel()
+    @ObservationIgnored private let countdownOverlay = CountdownOverlay()
     @ObservationIgnored private let grantPanel = GrantPanel()
     @ObservationIgnored private let permissionsAtLaunch: PermissionReport
     @ObservationIgnored private var hotkey: GlobalHotkey?
@@ -202,6 +206,27 @@ final class Coordinator: FrameSink {
         Task { await stop(.discard) }
     }
 
+    /// Frames and audio stop reaching the file; the finished recording has no gap.
+    func togglePause() {
+        guard case .recording(let session, var run) = activity else { return }
+        switch run.clock {
+        case .running:
+            session.recorder.pause()
+            session.audio?.pause()
+            run.clock = run.clock.pausing(at: Date())
+        case .paused:
+            let pausedFor = session.recorder.resume()
+            session.audio?.resume(pausedFor: pausedFor)
+            run.clock = run.clock.resuming(at: Date())
+        }
+        enter(.recording(session, run))
+    }
+
+    /// Tucks the pill into a corner marker, or brings it back.
+    func toggleControls() {
+        hud.togglePresence()
+    }
+
     /// For the take that went wrong: throw it away and record the same screen,
     /// window or area again, start delay included.
     func restart() {
@@ -239,19 +264,22 @@ final class Coordinator: FrameSink {
             if !microphoneGranted { degradations.append(.microphone("microphone access denied")) }
         }
 
+        // Up before the countdown, like a selfie timer: the delay is the time to frame
+        // yourself and drag the bubble where it should sit.
+        let preview = camera.map { FacecamPreviewWindow(session: $0.session, captureFrame: source.screenFrame) }
+        preview?.show()
+
         if settings.startDelay.seconds > 0 {
-            switch await countdown(seconds: settings.startDelay.seconds, output: output) {
+            switch await countdown(seconds: settings.startDelay.seconds, output: output, over: source.screenFrame) {
             case .cancelled:
                 camera?.stop()
+                preview?.hide()
                 enter(.idle)
                 return
             case .completed:
                 enter(.starting(output))
             }
         }
-
-        let preview = camera.map { FacecamPreviewWindow(session: $0.session, captureFrame: source.screenFrame) }
-        preview?.show()
 
         try? FileManager.default.createDirectory(at: settings.saveFolder, withIntermediateDirectories: true)
         let url = settings.newRecordingURL(for: output)
@@ -301,8 +329,8 @@ final class Coordinator: FrameSink {
         }
 
         enter(.recording(
-            RecordingSession(source: source, recorder: recorder, encoder: encoderSetup.encoder, camera: camera, microphone: microphone, preview: preview),
-            RecordingRun(startedAt: Date(), output: output, dimensions: Dimensions(source.pixelSize), degradations: degradations)
+            RecordingSession(source: source, recorder: recorder, encoder: encoderSetup.encoder, audio: encoderSetup.audioChannel, camera: camera, microphone: microphone, preview: preview),
+            RecordingRun(clock: .started(at: Date()), output: output, degradations: degradations)
         ))
     }
 
@@ -313,7 +341,7 @@ final class Coordinator: FrameSink {
         return (.gif(.fast), .gifskiMissing)
     }
 
-    private func countdown(seconds: Int, output: Output) async -> CountdownOutcome {
+    private func countdown(seconds: Int, output: Output, over area: CGRect) async -> CountdownOutcome {
         let task = Task<CountdownOutcome, Never> { [weak self] in
             for remaining in stride(from: seconds - 1, through: 0, by: -1) {
                 do { try await Task.sleep(for: .seconds(1)) } catch { return .cancelled }
@@ -321,7 +349,7 @@ final class Coordinator: FrameSink {
             }
             return .completed
         }
-        enter(.countingDown(Countdown(task: task, remaining: seconds, output: output)))
+        enter(.countingDown(Countdown(task: task, remaining: seconds, output: output, area: area)))
         return await task.value
     }
 
@@ -431,6 +459,10 @@ final class Coordinator: FrameSink {
         case .recording: break
         case .idle, .choosingRegion, .choosingSource, .starting, .countingDown, .finishing, .settled:
             if micLevel != 0 { micLevel = 0 }
+        }
+        switch next {
+        case .countingDown(let countdown): countdownOverlay.show(countdown.remaining, over: countdown.area)
+        case .idle, .choosingRegion, .choosingSource, .starting, .recording, .finishing, .settled: countdownOverlay.hide()
         }
         hud.render(phase)
         menuBar.render(phase)

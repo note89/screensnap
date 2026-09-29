@@ -13,10 +13,17 @@ struct MenuView: View {
         switch coordinator.phase {
         case .recording:
             Button("Finish recording") { coordinator.finish() }
+            if case .recording(let run) = coordinator.phase, case .paused = run.clock {
+                Button("Resume recording") { coordinator.togglePause() }
+            } else {
+                Button("Pause recording") { coordinator.togglePause() }
+            }
             Button("Start over") { coordinator.restart() }
             Button("Discard recording") { coordinator.discard() }
+            Button("Hide or show controls  \(HUDPanel.presenceShortcut)") { coordinator.toggleControls() }
         case .countingDown:
             Button("Cancel countdown") { coordinator.cancelCountdown() }
+            Button("Hide or show controls  \(HUDPanel.presenceShortcut)") { coordinator.toggleControls() }
         case .idle, .settled, .pickingSource, .starting, .finishing:
             ForEach(CaptureMode.allCases, id: \.self) { mode in
                 Button {

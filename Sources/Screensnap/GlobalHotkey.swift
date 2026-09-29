@@ -60,7 +60,8 @@ final class GlobalHotkey {
         )
         if installStatus != noErr { return nil }
 
-        let hotKeyID = EventHotKeyID(signature: OSType(0x47494652 /* "GIFR" */), id: 1)
+        // Unique per key combination, so each instance's handler ignores the others' presses.
+        let hotKeyID = EventHotKeyID(signature: OSType(0x47494652 /* "GIFR" */), id: UInt32(keyCode) | UInt32(modifiers) << 16)
         let registerStatus = RegisterEventHotKey(
             UInt32(keyCode),
             UInt32(modifiers),

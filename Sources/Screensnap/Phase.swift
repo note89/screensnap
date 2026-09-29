@@ -16,10 +16,34 @@ enum Degradation: Equatable {
     }
 }
 
+/// Recorded time, excluding pauses. Either counting from a moment on, or frozen.
+enum RecordingClock: Equatable {
+    case running(since: Date, before: TimeInterval)
+    case paused(total: TimeInterval)
+
+    static func started(at date: Date) -> RecordingClock { .running(since: date, before: 0) }
+
+    func elapsed(at now: Date) -> TimeInterval {
+        switch self {
+        case .running(let since, let before): return before + now.timeIntervalSince(since)
+        case .paused(let total): return total
+        }
+    }
+
+    func pausing(at now: Date) -> RecordingClock {
+        guard case .running = self else { return self }
+        return .paused(total: elapsed(at: now))
+    }
+
+    func resuming(at now: Date) -> RecordingClock {
+        guard case .paused(let total) = self else { return self }
+        return .running(since: now, before: total)
+    }
+}
+
 struct RecordingRun: Equatable {
-    let startedAt: Date
+    var clock: RecordingClock
     let output: Output
-    let dimensions: Dimensions
     let degradations: [Degradation]
 }
 
