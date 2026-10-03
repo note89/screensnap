@@ -431,16 +431,17 @@ TaskSteps ==
 
 Next == UserSteps \/ TaskSteps
 
-\* Tasks and timers always get to run; people need not act. Strong fairness, because
+\* Tasks and timers always get to run; people need not act. One condition per task,
+\* since a task has at most one step enabled at a time; strong fairness, because
 \* DoRelease disables every other step for one state and must not count as starving them.
+BeginStep == BeginCamera \/ BeginMic \/ BeginAfterCountdown \/ BeginEncoder \/ BeginRecorderStart
+StopStep(i) == StopStart(i) \/ StopRecorderStop(i) \/ StopEncoderFinish(i) \/ FitLoad(i) \/ FitCompress(i)
+CompressStep == CompressLoad \/ CompressDone
+
 Fairness ==
   /\ WF_vars(DoRelease)
-  /\ SF_vars(BeginCamera) /\ SF_vars(BeginMic) /\ SF_vars(CountdownFires) /\ SF_vars(BeginAfterCountdown)
-  /\ SF_vars(BeginEncoder) /\ SF_vars(BeginRecorderStart)
-  /\ \A i \in 1..StopSlots:
-       SF_vars(StopStart(i)) /\ SF_vars(StopRecorderStop(i)) /\ SF_vars(StopEncoderFinish(i))
-       /\ SF_vars(FitLoad(i)) /\ SF_vars(FitCompress(i))
-  /\ SF_vars(CompressLoad) /\ SF_vars(CompressDone) /\ SF_vars(DelayedQuitFires)
+  /\ SF_vars(BeginStep) /\ SF_vars(CountdownFires) /\ SF_vars(CompressStep) /\ SF_vars(DelayedQuitFires)
+  /\ \A i \in 1..StopSlots: SF_vars(StopStep(i))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 

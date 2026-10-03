@@ -27,8 +27,10 @@ What it checks, in the spec's own words:
 | `QuitAnswered`, `FinishSettles` | every accepted quit is eventually answered; every finish settles |
 
 Run it with `./Scripts/check-model.sh` (needs Java; fetches the TLA+ tools once).
-The invariants take seconds; the two liveness properties, with strong fairness,
-take minutes.
+About 1,800 distinct states; the whole check, liveness included, takes seconds.
+Fairness is one condition per task rather than per step: with twenty strong
+fairness conditions TLC's liveness check did not finish in half an hour, with six
+it takes a second, and a task has at most one step enabled at a time anyway.
 
 ### What the first run found
 
