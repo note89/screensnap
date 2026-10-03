@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        coordinator.willTerminate()
         if case .relaunch = coordinator.afterQuit { Relaunch.launchFreshCopy() }
     }
 }
