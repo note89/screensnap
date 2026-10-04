@@ -26,7 +26,9 @@ enum CompressionOutcome: Equatable {
 /// A recording's devices and encoder as `begin` brings them up, in order. Each is
 /// optional until it is up; `abandon()` releases whatever is, so every failure exit
 /// tears down the same way, and a device added here is released on all of them.
-@MainActor private struct SessionSetup {
+/// A class, so the coordinator can hold the one in flight and abandon it from
+/// `willTerminate()` when a quit lands between two of `begin`'s awaits.
+@MainActor private final class SessionSetup {
     var camera: CameraCapture?
     var preview: FacecamPreviewWindow?
     var microphone: MicrophoneCapture?
@@ -44,6 +46,9 @@ enum CompressionOutcome: Equatable {
 /// so a recording without a session, or a session left over after stopping,
 /// cannot be represented.
 @MainActor private struct RecordingSession {
+    /// Tells a stop task spawned for this recording from one spawned for the next:
+    /// a task that runs late finds a different id and does nothing.
+    let id = UUID()
     let source: CaptureSource
     let recorder: ScreenRecorder
     let encoder: FrameEncoder
@@ -139,7 +144,7 @@ final class Coordinator: FrameSink, HUDModel {
     /// Zero unless recording; `enter(_:)` resets it on the way out.
     private(set) var micLevel: Float = 0
     /// The one compression under way, whether the size limit or the Recordings pane
-    /// asked for it. Only `run(_:info:)` writes it.
+    /// asked for it. Only `run(_:)` writes it.
     private(set) var compression: CompressionJob?
     private(set) var permissions: PermissionReport
     private(set) var gifski: GifskiAvailability
@@ -160,7 +165,10 @@ final class Coordinator: FrameSink, HUDModel {
     @ObservationIgnored private let countdownOverlay = CountdownOverlay()
     @ObservationIgnored private let grantPanel = GrantPanel()
     @ObservationIgnored private let permissionsAtLaunch: PermissionReport
-    @ObservationIgnored private var pendingQuit = PendingQuit.notRequested
+    /// Observed: the menu says the app is quitting, and record buttons go quiet.
+    private var pendingQuit = PendingQuit.notRequested
+    /// What `begin` has brought up so far, while it is between awaits.
+    @ObservationIgnored private var setupInFlight: SessionSetup?
     /// Set by `quit(then:)` just before it asks AppKit to terminate and consumed by
     /// the terminate reply, so a ⌘Q from anywhere else is a plain exit.
     @ObservationIgnored private var requestedAfterQuit: AfterQuit = .exit
@@ -204,6 +212,21 @@ final class Coordinator: FrameSink, HUDModel {
     }
 
     var finishKeys: String? { hotkey.advertisedKeys }
+
+    /// A quit was accepted and waits for a save; no new recording or compression
+    /// starts under it, or the quit could wait forever.
+    var isQuitting: Bool {
+        if case .waitingForSave = pendingQuit { return true }
+        return false
+    }
+
+    /// From `applicationWillTerminate`. A quit accepted while a recording was being set
+    /// up (a safe moment: nothing is on disk yet) still has the devices and the
+    /// encoder's scratch space to release.
+    func willTerminate() {
+        setupInFlight?.abandon()
+        setupInFlight = nil
+    }
 
     /// The keys that tuck the pill, while there is a pill to tuck.
     var controlsKeys: String? { hud.chrome.presenceKeys }
@@ -269,18 +292,32 @@ final class Coordinator: FrameSink, HUDModel {
             return .terminateNow
         case .interruptsSave:
             pendingQuit = .waitingForSave(then: outcome)
+            abandonSetupForQuit()
             return .terminateLater
         case .losesRecording:
             guard let reason = askHowToEndRecording() else { return .terminateCancel }
             // The alert ran a modal loop, and ⌘⇧. or a failure may have ended the
             // recording meanwhile.
-            guard case .recording = activity else {
+            guard case .recording(let session, _) = activity else {
                 requestedAfterQuit = outcome
                 return handleQuitRequest()
             }
             pendingQuit = .waitingForSave(then: outcome)
-            Task { await stop(reason) }
+            Task { await stop(reason, of: session.id) }
             return .terminateLater
+        }
+    }
+
+    /// A quit was accepted while something was still being set up: a source being
+    /// picked, a countdown, a session coming up. None of it has produced anything, so
+    /// it ends now rather than starting a recording under a quit. `begin` ends itself
+    /// at its next await by checking `isQuitting`.
+    private func abandonSetupForQuit() {
+        switch activity {
+        case .choosingRegion(let selector): selector.cancel()
+        case .choosingSource: enter(.idle)                     // pick(_:) drops the picker's answer
+        case .countingDown(let countdown): countdown.task.cancel()
+        case .idle, .starting, .recording, .finishing, .settled: break
         }
     }
 
@@ -336,7 +373,7 @@ final class Coordinator: FrameSink, HUDModel {
     }
 
     func record(_ mode: CaptureMode) {
-        guard !phase.isBusy else { return }
+        guard !phase.isBusy, !isQuitting else { return }
         settings.captureMode = mode
         refreshPermissions()
         refreshGifski()
@@ -388,11 +425,18 @@ final class Coordinator: FrameSink, HUDModel {
     }
 
     func finish() {
-        Task { await stop(.finish) }
+        stopCurrent(.finish)
     }
 
     func discard() {
-        Task { await stop(.discard) }
+        stopCurrent(.discard)
+    }
+
+    /// Captures which recording the stop is for before the task runs, so a stop that
+    /// runs late, after that recording ended and another began, does nothing.
+    private func stopCurrent(_ reason: StopReason) {
+        guard case .recording(let session, _) = activity else { return }
+        Task { await stop(reason, of: session.id) }
     }
 
     /// Frames and audio stop reaching the file; the finished recording has no gap.
@@ -420,7 +464,7 @@ final class Coordinator: FrameSink, HUDModel {
     /// For the take that went wrong: throw it away and record the same screen,
     /// window or area again, start delay included.
     func restart() {
-        Task { await stop(.restart) }
+        stopCurrent(.restart)
     }
 
     func dismissSettled() {
@@ -435,10 +479,23 @@ final class Coordinator: FrameSink, HUDModel {
         }
         var (encoder, degradations) = Self.plan(settings.output, gifski: gifski)
         enter(.starting(encoder.output))
-        var setup = SessionSetup()
+        let setup = SessionSetup()
+        setupInFlight = setup
+        defer { setupInFlight = nil }
+
+        // After each await: a quit accepted meanwhile ends this here, before it
+        // produces anything.
+        func quitting() -> Bool {
+            guard isQuitting else { return false }
+            setup.abandon()
+            enter(.idle)
+            return true
+        }
 
         if settings.facecam == .bubble {
-            if await Permissions.ensureCameraAccess() {
+            let granted = await Permissions.ensureCameraAccess()
+            if quitting() { return }
+            if granted {
                 let capture = CameraCapture()
                 do {
                     try capture.start()
@@ -455,7 +512,9 @@ final class Coordinator: FrameSink, HUDModel {
         // cannot deliver takes the voice track out of the plan instead of leaving an
         // empty one in the file with a chip that says "voice".
         if case .mp4(.microphone) = encoder {
-            if await Permissions.ensureMicrophoneAccess() {
+            let granted = await Permissions.ensureMicrophoneAccess()
+            if quitting() { return }
+            if granted {
                 let capture = MicrophoneCapture { [weak self] level in
                     Task { @MainActor [weak self] in self?.showMicLevel(level) }
                 }
@@ -489,6 +548,7 @@ final class Coordinator: FrameSink, HUDModel {
                 enter(.idle)
                 return
             case .completed:
+                if quitting() { return }
                 enter(.starting(encoder.output))
             }
         }
@@ -523,6 +583,12 @@ final class Coordinator: FrameSink, HUDModel {
         } catch {
             setup.abandon()
             settle(.failed(error.localizedDescription))
+            return
+        }
+        if isQuitting {
+            _ = await recorder.stop()
+            setup.abandon()
+            enter(.idle)
             return
         }
 
@@ -570,16 +636,18 @@ final class Coordinator: FrameSink, HUDModel {
         micLevel = level
     }
 
-    private func stop(_ reason: StopReason) async {
-        guard case .recording(let session, let run) = activity else { return }
+    private func stop(_ reason: StopReason, of id: UUID) async {
+        guard case .recording(let session, let run) = activity, session.id == id else { return }
         switch reason {
         case .discard:
-            // Before settling, so the partial file is out of the save folder by the
-            // time a pending quit is released. The sink ignores frames that arrive after.
+            // The partial file is gone the moment the encoder is cancelled. Settling
+            // waits for the recorder and devices to let go, so the next recording,
+            // or a pending quit, never overlaps this one's teardown.
             session.encoder.cancel()
-            settle(.discarded)
+            enter(.finishing(.stopping))
             _ = await session.recorder.stop()
             session.stopDevices()
+            settle(.discarded)
         case .restart:
             session.encoder.cancel()
             enter(.starting(run.output))
@@ -598,7 +666,7 @@ final class Coordinator: FrameSink, HUDModel {
                 }
                 var fit: FitOutcome?
                 if case .atMost(let ceiling) = settings.sizeLimit, recording.bytes > ceiling.size {
-                    let fitted = try await self.fit(recording, under: ceiling.size)
+                    let fitted = await self.fit(recording, under: ceiling.size)
                     recording = fitted.recording
                     fit = fitted.outcome
                 }
@@ -616,18 +684,25 @@ final class Coordinator: FrameSink, HUDModel {
     }
 
     /// Shrinks a fresh recording under the limit through the same job slot the
-    /// Recordings pane uses. A slot already taken leaves the recording as it is and
-    /// says so, rather than running two compressions at once.
-    private func fit(_ recording: Recording, under limit: ByteCount) async throws -> (recording: Recording, outcome: FitOutcome) {
+    /// Recordings pane uses. The recording is already on disk, so a shrink that
+    /// cannot run or fails is a note on the saved recording, never a failed one. The
+    /// slot check and the claim in `run` are in one synchronous stretch, so nothing
+    /// can take the slot in between.
+    private func fit(_ recording: Recording, under limit: ByteCount) async -> (recording: Recording, outcome: FitOutcome) {
         guard compression == nil else { return (recording, .skipped(limit)) }
         enter(.finishing(.fittingToLimit(limit)))
-        guard let info = await library.loadInfo(for: recording) else { throw CompressionError.unreadable }
         let job = CompressionJob(recording: recording, target: .size(limit), placement: .replaceOriginal, origin: .sizeLimit, progress: 0)
-        let result = try await run(job, info: info)
-        guard let fitted = library.recording(at: result.url) ?? Recording(url: result.url) else { throw CompressionError.unreadable }
-        switch result.fit {
-        case .met: return (fitted, .shrunk(under: limit))
-        case .exceeded: return (fitted, .stillOver(limit))
+        do {
+            let result = try await run(job)
+            guard let fitted = library.recording(at: result.url) ?? Recording(url: result.url) else {
+                return (recording, .notShrunk(limit, reason: CompressionError.unreadable.localizedDescription))
+            }
+            switch result.fit {
+            case .met: return (fitted, .shrunk(under: limit))
+            case .exceeded: return (fitted, .stillOver(limit))
+            }
+        } catch {
+            return (recording, .notShrunk(limit, reason: error.localizedDescription))
         }
     }
 
@@ -639,12 +714,13 @@ final class Coordinator: FrameSink, HUDModel {
         return Delivered(copiedToClipboard: copy, revealedInFinder: reveal)
     }
 
-    private func abort(_ error: Error) async {
-        guard case .recording(let session, _) = activity else { return }
+    private func abort(_ error: Error, of id: UUID) async {
+        guard case .recording(let session, _) = activity, session.id == id else { return }
         session.encoder.cancel()
-        settle(.failed(error.localizedDescription))
+        enter(.finishing(.stopping))
         _ = await session.recorder.stop()
         session.stopDevices()
+        settle(.failed(error.localizedDescription))
     }
 
     private func settle(_ settlement: Settlement) {
@@ -692,12 +768,13 @@ final class Coordinator: FrameSink, HUDModel {
         do {
             try session.encoder.append(frame)
         } catch {
-            Task { await abort(error) }
+            Task { await abort(error, of: session.id) }
         }
     }
 
     func sinkDidFail(with error: Error) {
-        Task { await abort(error) }
+        guard case .recording(let session, _) = activity else { return }
+        Task { await abort(error, of: session.id) }
     }
 
     // MARK: Library
@@ -718,27 +795,26 @@ final class Coordinator: FrameSink, HUDModel {
     }
 
     func compress(_ recording: Recording, to target: CompressionTarget, placement: CompressionPlacement) async -> CompressionOutcome {
-        guard compression == nil else { return .failed(CompressionError.busy.localizedDescription) }
-        guard let info = await library.loadInfo(for: recording) else {
-            return .failed(CompressionError.unreadable.localizedDescription)
-        }
+        guard !isQuitting else { return .failed("Screensnap is quitting.") }
         do {
             let job = CompressionJob(recording: recording, target: target, placement: placement, origin: .manual, progress: 0)
-            return .done(try await run(job, info: info))
+            return .done(try await run(job))
         } catch {
             return .failed(error.localizedDescription)
         }
     }
 
-    /// The one way a compression runs. Claims the single job slot for its duration,
-    /// so two compressions, whoever asked for them, never run at once.
-    private func run(_ job: CompressionJob, info: MediaInfo) async throws -> CompressionResult {
+    /// The one way a compression runs. Claims the single job slot before anything is
+    /// awaited and holds it until done, so two compressions, whoever asked for them,
+    /// never run at once and never race each other for the slot.
+    private func run(_ job: CompressionJob) async throws -> CompressionResult {
         guard compression == nil else { throw CompressionError.busy }
         compression = job
         defer {
             compression = nil
             releasePendingQuitIfSafe()
         }
+        guard let info = await library.loadInfo(for: job.recording) else { throw CompressionError.unreadable }
         let result = try await Compressor.compress(job.recording, info: info, to: job.target, placement: job.placement) { [weak self] progress in
             Task { @MainActor [weak self] in
                 // A late update from a finished job must not move another job's bar.

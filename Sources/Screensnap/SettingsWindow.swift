@@ -116,7 +116,7 @@ private struct CapturePane: View {
             } label: {
                 Label("Record \(settings.captureMode.label.lowercased()) now", systemImage: "record.circle")
             }
-            .disabled(coordinator.phase.isBusy)
+            .disabled(coordinator.phase.isBusy || coordinator.isQuitting)
 
             Divider().padding(.vertical, 4)
 
@@ -651,7 +651,7 @@ private struct RecordingRow: View {
                 }
                 .buttonStyle(.plain)
                 .help("Make smaller…")
-                .disabled(coordinator.compression != nil)
+                .disabled(coordinator.compression != nil || coordinator.isQuitting)
                 .popover(isPresented: $compressing, arrowEdge: .bottom) {
                     CompressPopover(recording: recording, info: library.requestInfo(for: recording)) { target, placement in
                         compressing = false

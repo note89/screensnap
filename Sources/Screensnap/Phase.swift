@@ -43,31 +43,41 @@ struct RecordingRun: Equatable {
     let degradations: [Degradation]
 }
 
+/// The recording is over and its session is being wound down. Busy, whichever way
+/// it ends: the next recording starts only once this one has let go of its
+/// recorder and devices.
 enum FinishStep: Equatable {
     case encoding(Output)
     /// The shrink runs as the coordinator's one compression job; its progress lives there.
     case fittingToLimit(ByteCount)
+    /// Discarded or aborted: the capture is stopping, nothing is being written.
+    case stopping
 
     var label: String {
         switch self {
         case .encoding(let output): return "Encoding \(output.label)…"
         case .fittingToLimit(let limit): return "Shrinking to fit \(limit.formatted)…"
+        case .stopping: return "Stopping…"
         }
     }
 }
 
-/// How the size limit was applied to a fresh recording that came out over it.
+/// How the size limit was applied to a fresh recording that came out over it. The
+/// recording is on disk before any of this runs, so none of these is a failure.
 enum FitOutcome: Equatable {
     case shrunk(under: ByteCount)
     case stillOver(ByteCount)
     /// Another compression held the job slot, so the recording was saved as it was.
     case skipped(ByteCount)
+    /// The shrink could not read or re-encode the file; the original was kept.
+    case notShrunk(ByteCount, reason: String)
 
     var message: String {
         switch self {
         case .shrunk(let limit): return "shrunk to fit \(limit.formatted)"
         case .stillOver(let limit): return "could not get under \(limit.formatted)"
         case .skipped(let limit): return "not shrunk to \(limit.formatted) — another compression was running"
+        case .notShrunk(let limit, let reason): return "not shrunk to \(limit.formatted) — \(reason)"
         }
     }
 }

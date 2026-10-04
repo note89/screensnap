@@ -31,7 +31,7 @@ struct MenuView: View {
                 } label: {
                     Label("Record \(mode.label.lowercased())", systemImage: mode.icon)
                 }
-                .disabled(coordinator.phase.isBusy)
+                .disabled(coordinator.phase.isBusy || coordinator.isQuitting)
             }
         }
         Divider()
@@ -75,6 +75,7 @@ struct MenuView: View {
     }
 
     private var statusLine: String {
+        if coordinator.isQuitting { return "quitting once the save is done…" }
         switch coordinator.phase {
         case .idle:
             if let job = coordinator.compression { return "compressing \(job.recording.name)…" }
