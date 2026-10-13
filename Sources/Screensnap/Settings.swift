@@ -145,7 +145,7 @@ final class Settings {
         defaults.register(defaults: [
             Key.framerate: 15,
             Key.mp4Framerate: 30,
-            Key.startDelay: 0,
+            Key.startDelay: 3,
             Key.captureCursor: true,
             Key.revealInFinder: false,
             Key.sizeLimitBytes: 100_000_000,
