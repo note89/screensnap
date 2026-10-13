@@ -25,6 +25,13 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let queue = DispatchQueue(label: "Screensnap.cameraQueue")
     private let lock = NSLock()
     private var latestBuffer: CVPixelBuffer?
+    /// Frames seen while warming up; touched only on `queue`. A camera's first
+    /// frames come out black while it powers up and sets exposure, and the bubble
+    /// would record that black disc, so they are dropped. `nil` once warm.
+    private var warmUpFrames: Int? = 0
+    /// Past this many frames (about two seconds) any frame counts: in a dark room a
+    /// dim face is still better than no bubble at all.
+    private static let warmUpLimit = 60
 
     func start() throws {
         guard let device = AVCaptureDevice.default(for: .video) else {
@@ -70,9 +77,42 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        if let seen = warmUpFrames {
+            guard seen >= Self.warmUpLimit || !Self.isBlack(buffer) else {
+                warmUpFrames = seen + 1
+                return
+            }
+            warmUpFrames = nil
+        }
         lock.lock()
         latestBuffer = buffer
         lock.unlock()
+    }
+}
+
+extension CameraCapture {
+    /// Whether a BGRA frame is (nearly) all black, judged from a 16×16 grid of
+    /// samples so the check costs next to nothing per frame.
+    static func isBlack(_ buffer: CVPixelBuffer) -> Bool {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return true }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let pixels = base.assumingMemoryBound(to: UInt8.self)
+        let grid = 16
+        var total = 0
+        for row in 0..<grid {
+            let y = (row * 2 + 1) * height / (grid * 2)
+            for column in 0..<grid {
+                let x = (column * 2 + 1) * width / (grid * 2)
+                let pixel = pixels + y * bytesPerRow + x * 4
+                total += Int(pixel[0]) + Int(pixel[1]) + Int(pixel[2])
+            }
+        }
+        // Mean channel value below 6 of 255: black, not merely a dark room.
+        return total < 6 * 3 * grid * grid
     }
 }
 
