@@ -103,7 +103,8 @@ enum EncoderChoice: Equatable {
     }
 }
 
-/// The encoder for a choice, plus the audio channel when the output records one.
+/// The encoder for a choice, plus the audio channel when the container carries sound.
+/// Every MP4 gets one, so the microphone can be switched on mid-recording.
 struct EncoderSetup {
     let encoder: FrameEncoder
     let audioChannel: AudioWriterChannel?
@@ -115,8 +116,8 @@ struct EncoderSetup {
             return EncoderSetup(encoder: try ImageIOGifEncoder(outputURL: url), audioChannel: nil)
         case .gifski(let gifski):
             return EncoderSetup(encoder: try GifskiEncoder(gifski: gifski, outputURL: url, framerate: framerate, quality: GifskiEncoder.defaultQuality), audioChannel: nil)
-        case .mp4(let audio):
-            let encoder = try MP4Encoder(outputURL: url, framerate: framerate, pixelSize: pixelSize, audio: audio)
+        case .mp4:
+            let encoder = try MP4Encoder(outputURL: url, framerate: framerate, pixelSize: pixelSize)
             return EncoderSetup(encoder: encoder, audioChannel: encoder.audioChannel)
         }
     }
@@ -388,10 +389,17 @@ final class AudioWriterChannel: @unchecked Sendable {
 
     private let input: AVAssetWriterInput
     private let state: OSAllocatedUnfairLock<State>
+    /// Muted buffers are written as silence, not dropped: the writer closes gaps
+    /// in an audio track, which would pull later speech out of sync with the video.
+    private let muted = OSAllocatedUnfairLock(initialState: false)
 
     init(input: AVAssetWriterInput) {
         self.input = input
         self.state = OSAllocatedUnfairLock(initialState: .waitingForVideo)
+    }
+
+    func setMuted(_ isMuted: Bool) {
+        muted.withLock { $0 = isMuted }
     }
 
     /// Called once the writer session has started; anchors the audio timeline.
@@ -408,7 +416,8 @@ final class AudioWriterChannel: @unchecked Sendable {
             let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
             let shifted = CMTimeSubtract(pts, CMTime(seconds: hostZero, preferredTimescale: pts.timescale))
             guard shifted >= .zero else { return } // audio from before the first video frame
-            guard let retimed = Self.retimed(buffer, to: shifted) else { return }
+            let source = muted.withLock { $0 } ? Self.silenced(buffer) ?? buffer : buffer
+            guard let retimed = Self.retimed(source, to: shifted) else { return }
             input.append(retimed)
         }
     }
@@ -439,6 +448,30 @@ final class AudioWriterChannel: @unchecked Sendable {
             s = .closed
             input.markAsFinished()
         }
+    }
+
+    /// Same format, length and timing, every sample zero. Zero bits are silence
+    /// for both integer and float linear PCM, which is what the microphone delivers.
+    private static func silenced(_ buffer: CMSampleBuffer) -> CMSampleBuffer? {
+        guard let format = CMSampleBufferGetFormatDescription(buffer),
+              let source = CMSampleBufferGetDataBuffer(buffer) else { return nil }
+        let length = CMBlockBufferGetDataLength(source)
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: length, blockAllocator: nil,
+            customBlockSource: nil, offsetToData: 0, dataLength: length,
+            flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block
+        ) == noErr, let block,
+              CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0, dataLength: length) == noErr
+        else { return nil }
+        var out: CMSampleBuffer?
+        CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
+            sampleCount: CMSampleBufferGetNumSamples(buffer),
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(buffer),
+            packetDescriptions: nil, sampleBufferOut: &out
+        )
+        return out
     }
 
     private static func retimed(_ buffer: CMSampleBuffer, to pts: CMTime) -> CMSampleBuffer? {
@@ -473,10 +506,10 @@ final class MP4Encoder: FrameEncoder {
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
     private var session = Session.notStarted
     private var lifecycle = EncoderLifecycle.open
-    /// Present iff the encoder was created with `audio: .microphone`.
-    let audioChannel: AudioWriterChannel?
+    /// Always present. A track that never receives a sample is left out of the file.
+    let audioChannel: AudioWriterChannel
 
-    init(outputURL: URL, framerate: Framerate, pixelSize: Dimensions, audio: AudioTrack) throws {
+    init(outputURL: URL, framerate: Framerate, pixelSize: Dimensions) throws {
         self.outputURL = outputURL
         try? FileManager.default.removeItem(at: outputURL)
         self.writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
@@ -508,24 +541,19 @@ final class MP4Encoder: FrameEncoder {
         }
         writer.add(input)
 
-        switch audio {
-        case .microphone:
-            let audioSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 44_100,
-                AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 128_000,
-            ]
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            audioInput.expectsMediaDataInRealTime = true
-            guard writer.canAdd(audioInput) else {
-                throw NSError(domain: "Screensnap", code: 9, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter cannot add audio input"])
-            }
-            writer.add(audioInput)
-            self.audioChannel = AudioWriterChannel(input: audioInput)
-        case .none:
-            self.audioChannel = nil
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44_100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 128_000,
+        ]
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        audioInput.expectsMediaDataInRealTime = true
+        guard writer.canAdd(audioInput) else {
+            throw NSError(domain: "Screensnap", code: 9, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter cannot add audio input"])
         }
+        writer.add(audioInput)
+        self.audioChannel = AudioWriterChannel(input: audioInput)
     }
 
     /// Bits per pixel per frame, so the budget follows the framerate: 1 fps and 60 fps
@@ -546,7 +574,7 @@ final class MP4Encoder: FrameEncoder {
             session = .started(firstTimestamp: firstTimestamp)
             writer.startWriting()
             writer.startSession(atSourceTime: .zero)
-            audioChannel?.activate(hostZero: frame.hostTime)
+            audioChannel.activate(hostZero: frame.hostTime)
         case .started(let first):
             firstTimestamp = first
         }
@@ -563,7 +591,7 @@ final class MP4Encoder: FrameEncoder {
     func finish(at end: CFTimeInterval) async throws -> FinishedEncoding {
         try lifecycle.finish()
         guard case .started = session else { throw EncoderError.noFrames }
-        audioChannel?.markFinished()
+        audioChannel.markFinished()
         input.markAsFinished()
         let writer = self.writer
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -580,7 +608,7 @@ final class MP4Encoder: FrameEncoder {
 
     func cancel() {
         guard lifecycle.cancel() else { return }
-        audioChannel?.stopAccepting()
+        audioChannel.stopAccepting()
         if case .started = session { writer.cancelWriting() }
         try? FileManager.default.removeItem(at: outputURL)
     }

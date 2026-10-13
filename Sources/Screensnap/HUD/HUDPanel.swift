@@ -70,8 +70,8 @@ enum HUDLayout: Equatable {
 
     var size: NSSize {
         switch self {
-        case .pill(.horizontal): return NSSize(width: 520, height: 76)
-        case .pill(.vertical): return NSSize(width: 80, height: 380)
+        case .pill(.horizontal): return NSSize(width: 600, height: 76)
+        case .pill(.vertical): return NSSize(width: 80, height: 460)
         case .marker: return NSSize(width: 96, height: 40)
         }
     }

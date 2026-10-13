@@ -6,7 +6,7 @@ import SwiftUI
 @MainActor
 protocol HUDModel: AnyObject, Observable {
     var phase: Phase { get }
-    /// Zero unless recording with a microphone.
+    /// Zero unless recording with the microphone on.
     var micLevel: Float { get }
     /// The compression under way, whose progress the shrink-to-fit step shows.
     var compression: CompressionJob? { get }
@@ -17,6 +17,8 @@ protocol HUDModel: AnyObject, Observable {
     func togglePause()
     func restart()
     func discard()
+    func toggleFacecam()
+    func toggleMicrophone()
     func dismissSettled()
     func reveal(_ recording: Recording)
 }
@@ -84,7 +86,7 @@ private struct Pill: View {
                 }
                 TuckButton(keys: hud.chrome.presenceKeys, tuck: hud.togglePresence)
             case .recording(let run):
-                RecordingRow(run: run, axis: axis, micLevel: model.micLevel, finishKeys: model.finishKeys, finish: model.finish, togglePause: model.togglePause, restart: model.restart, discard: model.discard)
+                RecordingRow(run: run, axis: axis, micLevel: model.micLevel, finishKeys: model.finishKeys, model: model)
                 TuckButton(keys: hud.chrome.presenceKeys, tuck: hud.togglePresence)
             case .finishing(let step):
                 ProgressView().controlSize(.small).tint(.white)
@@ -134,9 +136,9 @@ private struct TuckButton: View {
     let tuck: () -> Void
 
     var body: some View {
-        PillButton(systemImage: "eye.slash", role: .quiet, action: tuck)
-            .help(keys.map { "Hide controls — \($0) (\(HUDPanel.presenceKeysSpoken)) brings them back" }
-                ?? "Hide controls — click the marker in the corner to bring them back")
+        PillButton(systemImage: "arrow.down.right.and.arrow.up.left", role: .quiet, action: tuck)
+            .help(keys.map { "Minimize controls — \($0) (\(HUDPanel.presenceKeysSpoken)) brings them back" }
+                ?? "Minimize controls — click the marker in the corner to bring them back")
     }
 }
 
@@ -192,10 +194,7 @@ private struct RecordingRow: View {
     let micLevel: Float
     /// nil when the global shortcut could not be registered.
     let finishKeys: String?
-    let finish: () -> Void
-    let togglePause: () -> Void
-    let restart: () -> Void
-    let discard: () -> Void
+    let model: any HUDModel
 
     @State private var pulse = false
 
@@ -218,28 +217,39 @@ private struct RecordingRow: View {
             Text(Self.format(total)).monospacedDigit().foregroundStyle(.orange)
         }
         if axis == .horizontal {
-            Chip(text: run.output.label)
+            // The container only: whether the voice is on is the microphone button's job.
+            Chip(text: run.output.container == .mp4 ? "MP4" : run.output.label)
         }
-        if run.output.recordsMicrophone {
+        if run.microphoneOn == true {
             MicMeter(level: micLevel)
         }
         switch axis {
         case .horizontal:
             Spacer(minLength: 4)
-            PillButton(title: "Finish", role: .primary, action: finish).help(finishKeys ?? "Finish")
+            PillButton(title: "Finish", role: .primary, action: model.finish).help(finishKeys ?? "Finish")
         case .vertical:
-            PillButton(systemImage: "stop.fill", role: .primary, action: finish).help(finishKeys.map { "Finish (\($0))" } ?? "Finish")
+            PillButton(systemImage: "stop.fill", role: .primary, action: model.finish).help(finishKeys.map { "Finish (\($0))" } ?? "Finish")
         }
         switch run.clock {
         case .running:
-            PillButton(systemImage: "pause.fill", role: .quiet, action: togglePause).help("Pause")
+            PillButton(systemImage: "pause.fill", role: .quiet, action: model.togglePause).help("Pause")
         case .paused:
-            PillButton(systemImage: "play.fill", role: .quiet, action: togglePause).help("Resume")
+            PillButton(systemImage: "play.fill", role: .quiet, action: model.togglePause).help("Resume")
         }
-        PillButton(systemImage: "arrow.counterclockwise", role: .quiet, action: restart)
+        PillButton(systemImage: "arrow.counterclockwise", role: .quiet, action: model.restart)
             .help("Start over")
-        PillButton(systemImage: "xmark", role: .quiet, action: discard)
+        PillButton(systemImage: "trash", role: .quiet, action: model.discard)
             .help("Discard")
+        DeviceToggle(on: run.facecamOn, onImage: "video.fill", offImage: "video.slash.fill", action: model.toggleFacecam)
+            .help(run.facecamOn ? "Turn facecam off" : "Turn facecam on")
+        if let microphoneOn = run.microphoneOn {
+            DeviceToggle(on: microphoneOn, onImage: "mic.fill", offImage: "mic.slash.fill", action: model.toggleMicrophone)
+                .help(microphoneOn ? "Mute microphone" : "Turn microphone on")
+        } else {
+            DeviceToggle(on: false, onImage: "mic.fill", offImage: "mic.slash.fill", action: {})
+                .disabled(true)
+                .help("GIFs have no sound — choose MP4 in Settings to record your voice")
+        }
     }
 
     private static func format(_ seconds: TimeInterval) -> String {
@@ -308,6 +318,35 @@ private struct MicMeter: View {
         }
         .animation(.linear(duration: 0.08), value: level)
         .help("Microphone level")
+    }
+}
+
+/// A device switch in the call-app idiom: plain icon when on, slashed and red when
+/// off, so its state reads at a glance. Disabled ones fade instead of turning red.
+private struct DeviceToggle: View {
+    let on: Bool
+    let onImage: String
+    let offImage: String
+    let action: () -> Void
+
+    @Environment(\.isEnabled) private var isEnabled
+
+    private var tint: Color {
+        if on { return .white }
+        return isEnabled ? Color(red: 1, green: 0.42, blue: 0.4) : .white.opacity(0.3)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: on ? onImage : offImage)
+                .font(.system(size: 11, weight: .bold))
+                .frame(width: 16)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 6)
+                .foregroundStyle(tint)
+                .background(Capsule().fill(on || !isEnabled ? Color.white.opacity(0.16) : Color.red.opacity(0.22)))
+        }
+        .buttonStyle(.plain)
     }
 }
 

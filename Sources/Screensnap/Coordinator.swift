@@ -52,16 +52,20 @@ enum CompressionOutcome: Equatable {
     let source: CaptureSource
     let recorder: ScreenRecorder
     let encoder: FrameEncoder
+    /// Present for MP4 even with the microphone off, so it can be switched on later.
     let audio: AudioWriterChannel?
-    let camera: CameraCapture?
-    let microphone: MicrophoneCapture?
-    let preview: FacecamPreviewWindow?
+    /// Where the bubble sits; outlives the camera, so switching it back on reuses it.
+    let placement: FacecamPlacementSource
+    var camera: CameraCapture?
+    var microphone: MicrophoneCapture?
+    var preview: FacecamPreviewWindow?
+}
 
-    func stopDevices() {
-        microphone?.stop()
-        camera?.stop()
-        preview?.hide()
-    }
+/// Which devices a recording starts with. A fresh recording takes them from the
+/// settings; "start over" keeps whatever the pill had switched them to.
+private struct DeviceChoice {
+    var facecam: Bool
+    var microphone: Bool
 }
 
 private enum CountdownOutcome {
@@ -141,7 +145,7 @@ final class Coordinator: FrameSink, HUDModel {
     private var activity: Activity = .idle
     /// What every surface renders. Derived, so it cannot disagree with `activity`.
     var phase: Phase { activity.phase }
-    /// Zero unless recording; `enter(_:)` resets it on the way out.
+    /// Zero unless recording with the microphone on; `enter(_:)` resets it otherwise.
     private(set) var micLevel: Float = 0
     /// The one compression under way, whether the size limit or the Recordings pane
     /// asked for it. Only `run(_:)` writes it.
@@ -172,6 +176,9 @@ final class Coordinator: FrameSink, HUDModel {
     /// Set by `quit(then:)` just before it asks AppKit to terminate and consumed by
     /// the terminate reply, so a ⌘Q from anywhere else is a plain exit.
     @ObservationIgnored private var requestedAfterQuit: AfterQuit = .exit
+    /// Where the facecam bubble was last left, so a restart or switching the camera
+    /// back on puts it there instead of the corner.
+    @ObservationIgnored private var lastBubbleFrame: CGRect?
 
     init() {
         permissionsAtLaunch = Permissions.check()
@@ -396,7 +403,7 @@ final class Coordinator: FrameSink, HUDModel {
                 Task { @MainActor [weak self] in
                     guard let self, case .choosingRegion = self.activity else { return }
                     guard let region else { self.enter(.idle); return }
-                    await self.begin(source: .region(region))
+                    await self.begin(source: .region(region), devices: self.devicesFromSettings)
                 }
             }
         case .display:
@@ -412,11 +419,15 @@ final class Coordinator: FrameSink, HUDModel {
             let choice = await SourcePicker.choose(kind)
             guard let self, case .choosingSource = self.activity else { return }
             switch choice {
-            case .picked(let source): await self.begin(source: source)
+            case .picked(let source): await self.begin(source: source, devices: self.devicesFromSettings)
             case .cancelled: self.enter(.idle)
             case .unavailable(let error): self.settle(.failed("Could not list what is on screen — \(error.localizedDescription)"))
             }
         }
+    }
+
+    private var devicesFromSettings: DeviceChoice {
+        DeviceChoice(facecam: settings.facecam == .bubble, microphone: settings.output.recordsMicrophone)
     }
 
     func cancelCountdown() {
@@ -456,6 +467,109 @@ final class Coordinator: FrameSink, HUDModel {
         enter(.recording(session, run))
     }
 
+    /// Switches the facecam bubble on or off for the rest of this recording.
+    func toggleFacecam() {
+        guard case .recording(var session, var run) = activity else { return }
+        guard let camera = session.camera else {
+            let id = session.id
+            Task { await turnOnFacecam(for: id) }
+            return
+        }
+        session.recorder.setOverlay(nil)
+        camera.stop()
+        hide(session.preview)
+        session.camera = nil
+        session.preview = nil
+        run.facecamOn = false
+        enter(.recording(session, run))
+    }
+
+    private func turnOnFacecam(for id: UUID) async {
+        guard await Permissions.ensureCameraAccess() else {
+            refreshPermissions()
+            Permissions.openSettings(.camera)
+            return
+        }
+        // The recording may have ended, or the camera come on, while the prompt was up.
+        guard case .recording(var session, var run) = activity, session.id == id, session.camera == nil,
+              let geometry = session.source.resolveGeometry() else { return }
+        let capture = CameraCapture()
+        do {
+            try capture.start()
+        } catch {
+            run.degradations.append(.camera(error.localizedDescription))
+            enter(.recording(session, run))
+            return
+        }
+        let preview = FacecamPreviewWindow(session: capture.session, captureFrame: geometry.screenFrame, placement: session.placement, restoring: lastBubbleFrame)
+        preview.show()
+        session.recorder.setOverlay(FacecamOverlay(camera: capture, placement: session.placement))
+        session.camera = capture
+        session.preview = preview
+        run.facecamOn = true
+        enter(.recording(session, run))
+    }
+
+    /// Mutes or unmutes the voice track of an MP4. Muting keeps the microphone
+    /// open and writes silence, so speech after unmuting stays in sync with the video.
+    func toggleMicrophone() {
+        guard case .recording(let session, var run) = activity, let on = run.microphoneOn, let channel = session.audio else { return }
+        if on {
+            channel.setMuted(true)
+            run.microphoneOn = false
+        } else if session.microphone != nil {
+            channel.setMuted(false)
+            run.microphoneOn = true
+        } else {
+            let id = session.id
+            Task { await turnOnMicrophone(for: id) }
+            return
+        }
+        enter(.recording(session, run))
+    }
+
+    private func turnOnMicrophone(for id: UUID) async {
+        guard await Permissions.ensureMicrophoneAccess() else {
+            refreshPermissions()
+            Permissions.openSettings(.microphone)
+            return
+        }
+        guard case .recording(var session, var run) = activity, session.id == id,
+              session.microphone == nil, let channel = session.audio else { return }
+        let capture = makeMicrophone()
+        do {
+            try capture.start()
+        } catch {
+            run.degradations.append(.microphone(error.localizedDescription))
+            enter(.recording(session, run))
+            return
+        }
+        capture.deliver(to: { channel.append($0) })
+        channel.setMuted(false)
+        session.microphone = capture
+        run.microphoneOn = true
+        enter(.recording(session, run))
+    }
+
+    private func makeMicrophone() -> MicrophoneCapture {
+        MicrophoneCapture { [weak self] level in
+            Task { @MainActor [weak self] in self?.showMicLevel(level) }
+        }
+    }
+
+    private func stopDevices(of session: RecordingSession) {
+        session.microphone?.stop()
+        session.camera?.stop()
+        hide(session.preview)
+    }
+
+    /// Every bubble that goes away leaves its position behind for the next one.
+    private func hide(_ preview: FacecamPreviewWindow?) {
+        guard let preview else { return }
+        lastBubbleFrame = preview.frame
+        preview.hide()
+    }
+
     /// Tucks the pill into a corner marker, or brings it back.
     func toggleControls() {
         hud.togglePresence()
@@ -472,12 +586,13 @@ final class Coordinator: FrameSink, HUDModel {
         enter(.idle)
     }
 
-    private func begin(source: CaptureSource) async {
+    private func begin(source: CaptureSource, devices: DeviceChoice) async {
         guard let geometry = source.resolveGeometry() else {
             settle(.failed("The display to record is no longer connected"))
             return
         }
         var (encoder, degradations) = Self.plan(settings.output, gifski: gifski)
+        if case .mp4 = encoder { encoder = .mp4(devices.microphone ? .microphone : .none) }
         enter(.starting(encoder.output))
         let setup = SessionSetup()
         setupInFlight = setup
@@ -492,7 +607,7 @@ final class Coordinator: FrameSink, HUDModel {
             return true
         }
 
-        if settings.facecam == .bubble {
+        if devices.facecam {
             let granted = await Permissions.ensureCameraAccess()
             if quitting() { return }
             if granted {
@@ -515,9 +630,7 @@ final class Coordinator: FrameSink, HUDModel {
             let granted = await Permissions.ensureMicrophoneAccess()
             if quitting() { return }
             if granted {
-                let capture = MicrophoneCapture { [weak self] level in
-                    Task { @MainActor [weak self] in self?.showMicLevel(level) }
-                }
+                let capture = makeMicrophone()
                 do {
                     try capture.start()
                     setup.microphone = capture
@@ -536,7 +649,7 @@ final class Coordinator: FrameSink, HUDModel {
         // yourself and drag the bubble where it should sit.
         let placement = FacecamPlacementSource()
         if let camera = setup.camera {
-            let preview = FacecamPreviewWindow(session: camera.session, captureFrame: geometry.screenFrame, placement: placement)
+            let preview = FacecamPreviewWindow(session: camera.session, captureFrame: geometry.screenFrame, placement: placement, restoring: lastBubbleFrame)
             preview.show()
             setup.preview = preview
         }
@@ -544,6 +657,7 @@ final class Coordinator: FrameSink, HUDModel {
         if settings.startDelay.seconds > 0 {
             switch await countdown(seconds: settings.startDelay.seconds, output: encoder.output, over: geometry.screenFrame) {
             case .cancelled:
+                if let preview = setup.preview { lastBubbleFrame = preview.frame }
                 setup.abandon()
                 enter(.idle)
                 return
@@ -595,9 +709,13 @@ final class Coordinator: FrameSink, HUDModel {
         enter(.recording(
             RecordingSession(
                 source: source, recorder: recorder, encoder: encoderSetup.encoder, audio: encoderSetup.audioChannel,
-                camera: setup.camera, microphone: setup.microphone, preview: setup.preview
+                placement: placement, camera: setup.camera, microphone: setup.microphone, preview: setup.preview
             ),
-            RecordingRun(clock: .started(at: Date()), output: encoder.output, degradations: degradations)
+            RecordingRun(
+                clock: .started(at: Date()), output: encoder.output, degradations: degradations,
+                facecamOn: setup.camera != nil,
+                microphoneOn: encoderSetup.audioChannel == nil ? nil : setup.microphone != nil
+            )
         ))
     }
 
@@ -632,7 +750,7 @@ final class Coordinator: FrameSink, HUDModel {
 
     /// Levels arrive on their own tasks and can land after the recording ended.
     private func showMicLevel(_ level: Float) {
-        guard case .recording = activity else { return }
+        guard case .recording(_, let run) = activity, run.microphoneOn == true else { return }
         micLevel = level
     }
 
@@ -646,18 +764,18 @@ final class Coordinator: FrameSink, HUDModel {
             session.encoder.cancel()
             enter(.finishing(.stopping))
             _ = await session.recorder.stop()
-            session.stopDevices()
+            stopDevices(of: session)
             settle(.discarded)
         case .restart:
             session.encoder.cancel()
             enter(.starting(run.output))
             _ = await session.recorder.stop()
-            session.stopDevices()
-            await begin(source: session.source)
+            stopDevices(of: session)
+            await begin(source: session.source, devices: DeviceChoice(facecam: run.facecamOn, microphone: run.microphoneOn ?? false))
         case .finish:
             enter(.finishing(.encoding(run.output)))
             let end = await session.recorder.stop()
-            session.stopDevices()
+            stopDevices(of: session)
             do {
                 let encoded = try await session.encoder.finish(at: end)
                 library.rescan()
@@ -719,7 +837,7 @@ final class Coordinator: FrameSink, HUDModel {
         session.encoder.cancel()
         enter(.finishing(.stopping))
         _ = await session.recorder.stop()
-        session.stopDevices()
+        stopDevices(of: session)
         settle(.failed(error.localizedDescription))
     }
 
@@ -746,8 +864,8 @@ final class Coordinator: FrameSink, HUDModel {
         if case .settled(_, let dismissal) = activity { dismissal.cancel() }
         activity = next
         switch next {
-        case .recording: break
-        case .idle, .choosingRegion, .choosingSource, .starting, .countingDown, .finishing, .settled:
+        case .recording(_, let run) where run.microphoneOn == true: break
+        case .idle, .choosingRegion, .choosingSource, .starting, .countingDown, .recording, .finishing, .settled:
             if micLevel != 0 { micLevel = 0 }
         }
         switch next {

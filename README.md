@@ -122,6 +122,7 @@ Each row shows a thumbnail, dimensions, duration, size, and date, and has four a
 
 - **Facecam** (Facecam pane): turn on the bubble and a live preview appears when recording starts. Drag it anywhere inside the recorded area — the bubble in the file sits exactly where the preview is. If the camera is busy or denied, the recording still happens and the pill tells you why the bubble is missing.
 - **Voice** (Output pane, MP4 only): turn on *Record my voice*. The pill shows a level meter while recording. GIFs cannot carry audio, so the option only exists for MP4.
+- **Switch them mid-recording.** The pill has a camera button and a microphone button: slashed and red means off. The facecam can be turned on or off at any time and comes back where you last left it, including after *Start over*. In an MP4 the microphone can be turned on or muted at any time; muted stretches are silent, so your voice stays in sync with the video.
 
 ## Permissions
 
