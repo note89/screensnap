@@ -272,6 +272,10 @@ private struct OutputPane: View {
     @Bindable var settings: Settings
     let coordinator: Coordinator
     @State private var customMB: String = ""
+    /// Kept apart from `settings.sizeLimit`: a custom number that happens to match a
+    /// preset (the field starts at the current limit, 100 MB by default) must not
+    /// flip the selection back to that preset and hide the field.
+    @State private var customChosen = false
 
     init(coordinator: Coordinator) {
         self.coordinator = coordinator
@@ -324,15 +328,23 @@ private struct OutputPane: View {
 
             SectionLabel("SHRINK TO FIT")
             Picker("", selection: Binding(
-                get: { SizeLimitChoice(settings.sizeLimit) },
+                get: { customChosen ? .custom : SizeLimitChoice(settings.sizeLimit) },
                 set: { choice in
                     switch choice {
-                    case .preset(let limit): settings.sizeLimit = limit
+                    case .preset(let limit):
+                        customChosen = false
+                        settings.sizeLimit = limit
                     case .custom:
-                        // Picked before typing a usable number: start from 50 MB.
-                        if let ceiling = SizeLimit.Ceiling(megabytesText: customMB) ?? SizeLimit.Ceiling(megabytes: 50) {
-                            settings.sizeLimit = .atMost(ceiling)
+                        customChosen = true
+                        // No usable number typed yet: start from the current limit, or 50 MB.
+                        if SizeLimit.Ceiling(megabytesText: customMB) == nil {
+                            if case .atMost(let ceiling) = settings.sizeLimit {
+                                customMB = String(ceiling.megabytes)
+                            } else {
+                                customMB = "50"
+                            }
                         }
+                        applyCustomMB()
                     }
                 }
             )) {
@@ -343,13 +355,16 @@ private struct OutputPane: View {
             }
             .pickerStyle(.radioGroup)
             .labelsHidden()
-            if case .custom = SizeLimitChoice(settings.sizeLimit) {
+            if customChosen {
                 HStack {
                     TextField("MB", text: $customMB)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 80)
-                        .onSubmit { if let ceiling = SizeLimit.Ceiling(megabytesText: customMB) { settings.sizeLimit = .atMost(ceiling) } }
+                        .onChange(of: customMB) { applyCustomMB() }
                     Text("MB").foregroundStyle(.secondary)
+                    if SizeLimit.Ceiling(megabytesText: customMB) == nil {
+                        Text("Enter a whole number above 0").font(.caption).foregroundStyle(.orange)
+                    }
                 }
             }
             Text("Record as long as you like. If the file comes out bigger, it is shrunk right after you finish — smaller frame, then fewer frames — until it fits. You see the final size in the pill.")
@@ -358,7 +373,18 @@ private struct OutputPane: View {
         .onAppear {
             coordinator.refreshGifski()
             if case .atMost(let ceiling) = settings.sizeLimit { customMB = String(ceiling.megabytes) }
+            customChosen = SizeLimitChoice(settings.sizeLimit) == .custom
         }
+        .onChange(of: settings.sizeLimit) {
+            // Changed elsewhere (the menu bar picker): follow it instead of the field.
+            guard customChosen, settings.sizeLimit != SizeLimit.Ceiling(megabytesText: customMB).map(SizeLimit.atMost) else { return }
+            customChosen = false
+        }
+    }
+
+    /// Every valid keystroke takes effect, so closing the window never loses a number.
+    private func applyCustomMB() {
+        if let ceiling = SizeLimit.Ceiling(megabytesText: customMB) { settings.sizeLimit = .atMost(ceiling) }
     }
 }
 

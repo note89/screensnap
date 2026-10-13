@@ -207,14 +207,25 @@ final class FacecamPreviewWindow {
         )
     }
 
-    init(session: AVCaptureSession, captureFrame: ScreenRect, placement source: FacecamPlacementSource) {
+    /// Where the user left the bubble, in screen points; hand it to the next
+    /// preview over the same area so it reappears there.
+    var frame: CGRect { panel.frame }
+
+    /// `restoring` puts the bubble back where an earlier preview had it, as long as
+    /// that spot still overlaps the captured area; otherwise it starts bottom-left.
+    init(session: AVCaptureSession, captureFrame: ScreenRect, placement source: FacecamPlacementSource, restoring previous: CGRect? = nil) {
         self.captureFrame = captureFrame
         self.source = source
         let area = captureFrame.cgRect
         let shortEdge = min(area.width, area.height)
         let diameter = min(max(shortEdge * FacecamPlacement.bottomLeft.diameter, 60), 260)
         let margin = diameter * 0.15
-        let rect = CGRect(x: area.minX + margin, y: area.minY + margin, width: diameter, height: diameter)
+        let rect: CGRect
+        if let previous, area.intersects(previous) {
+            rect = previous
+        } else {
+            rect = CGRect(x: area.minX + margin, y: area.minY + margin, width: diameter, height: diameter)
+        }
         panel = NSPanel(
             contentRect: rect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -242,7 +253,7 @@ final class FacecamPreviewWindow {
         let preview = AVCaptureVideoPreviewLayer(session: session)
         preview.frame = view.bounds
         preview.videoGravity = .resizeAspectFill
-        preview.cornerRadius = diameter / 2
+        preview.cornerRadius = rect.width / 2
         preview.masksToBounds = true
         preview.borderWidth = 2
         preview.borderColor = NSColor.white.withAlphaComponent(0.9).cgColor

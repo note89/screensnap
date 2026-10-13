@@ -89,7 +89,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let framerate: Framerate
     private let captureCursor: Bool
     private let excludeWindowIDs: [CGWindowID]
-    private let overlay: FacecamOverlay?
+    /// Read on the capture queue for every frame; swapped from the main actor when
+    /// the facecam is switched on or off mid-recording.
+    private let overlay: OSAllocatedUnfairLock<FacecamOverlay?>
     private weak var sink: FrameSink?
 
     private enum CaptureState {
@@ -136,8 +138,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         self.framerate = framerate
         self.captureCursor = captureCursor
         self.excludeWindowIDs = excludeWindowIDs
-        self.overlay = overlay
+        self.overlay = OSAllocatedUnfairLock(initialState: overlay)
         self.sink = sink
+    }
+
+    /// The next frame on is drawn with this facecam, or none.
+    func setOverlay(_ next: FacecamOverlay?) {
+        overlay.withLock { $0 = next }
     }
 
     func start() async throws {
@@ -255,7 +262,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let tick else { return }
 
         guard let captured = sampleBuffer.cgImage() else { return }
-        let image = overlay?.apply(to: captured) ?? captured
+        let image = overlay.withLock { $0 }?.apply(to: captured) ?? captured
         let frame = CapturedFrame(image: image, timestamp: tick.elapsed, hostTime: tick.hostTime)
         Task { @MainActor [weak self] in
             self?.sink?.sinkDidCapture(frame: frame)

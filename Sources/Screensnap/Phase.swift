@@ -40,7 +40,12 @@ enum RecordingClock: Equatable {
 struct RecordingRun: Equatable {
     var clock: RecordingClock
     let output: Output
-    let degradations: [Degradation]
+    var degradations: [Degradation]
+    /// Both can be switched from the pill while recording, so they start from the
+    /// settings but do not stay tied to them.
+    var facecamOn: Bool
+    /// `nil` when the output cannot carry sound (GIF).
+    var microphoneOn: Bool?
 }
 
 /// The recording is over and its session is being wound down. Busy, whichever way
