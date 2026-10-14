@@ -64,7 +64,8 @@ struct CaptureGeometry: Equatable {
 @MainActor
 protocol FrameSink: AnyObject {
     func sinkDidCapture(frame: CapturedFrame)
-    func sinkDidFail(with error: Error)
+    /// The stream ended without being asked to. The recording so far is intact.
+    func sinkWasInterrupted(by error: Error)
 }
 
 enum ScreenRecorderError: Error {
@@ -97,6 +98,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private enum CaptureState {
         case idle
         case capturing(stream: SCStream)
+        /// The system ended the stream (screen locked, display slept). The clock and
+        /// the encoder are untouched, so a new stream carries on the same file.
+        case interrupted
+        /// A replacement stream is starting. Only one at a time; a stop that lands
+        /// meanwhile wins, and the replacement is shut down when it comes up.
+        case reconnecting
         case stopped
     }
     private var captureState: CaptureState = .idle
@@ -149,7 +156,42 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() async throws {
         guard case .idle = captureState else { throw ScreenRecorderError.alreadyRunning }
+        let stream = try await makeStream()
+        try await stream.startCapture()
 
+        clock.withLock { $0 = .running(startedAt: CACurrentMediaTime(), lastEmitted: nil) }
+        self.captureState = .capturing(stream: stream)
+    }
+
+    /// True while the system has ended the stream and no replacement is running.
+    var isInterrupted: Bool {
+        if case .interrupted = captureState { return true }
+        return false
+    }
+
+    /// Starts a new stream for the same source after the system ended the old one.
+    /// The clock is left alone, so frames continue on the recording's timeline. Fails
+    /// while the screen is still locked, or when the source is gone; the recorder then
+    /// stays interrupted and can be tried again or stopped.
+    func reconnect() async throws {
+        guard case .interrupted = captureState else { return }
+        captureState = .reconnecting
+        let stream: SCStream
+        do {
+            stream = try await makeStream()
+            try await stream.startCapture()
+        } catch {
+            if case .reconnecting = captureState { captureState = .interrupted }
+            throw error
+        }
+        guard case .reconnecting = captureState else {
+            try? await stream.stopCapture()
+            return
+        }
+        captureState = .capturing(stream: stream)
+    }
+
+    private func makeStream() async throws -> SCStream {
         let config = SCStreamConfiguration()
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = captureCursor
@@ -183,10 +225,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
-        try await stream.startCapture()
-
-        clock.withLock { $0 = .running(startedAt: CACurrentMediaTime(), lastEmitted: nil) }
-        self.captureState = .capturing(stream: stream)
+        return stream
     }
 
     /// Excludes every window belonging to this process (HUD pill, facecam preview),
@@ -230,8 +269,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             state = .stopped
             return end
         }
-        guard case .capturing(let stream) = captureState else { return end }
-        self.captureState = .stopped
+        let live = captureState
+        captureState = .stopped
+        guard case .capturing(let stream) = live else { return end }
         try? await stream.stopCapture()
         return end
     }
@@ -269,10 +309,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Only the live stream's end counts; a late report from a stream already
+    /// replaced or stopped is ignored.
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task { @MainActor [weak self] in
-            guard let self = self else { return }
-            self.sink?.sinkDidFail(with: error)
+            guard let self, case .capturing(let current) = self.captureState, current === stream else { return }
+            self.captureState = .interrupted
+            self.sink?.sinkWasInterrupted(by: error)
         }
     }
 }

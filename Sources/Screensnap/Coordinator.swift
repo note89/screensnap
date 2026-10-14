@@ -202,6 +202,14 @@ final class Coordinator: FrameSink, HUDModel {
                 self?.refreshGifski()
             }
         }
+        // Each of these can follow the capture stream being ended by the system.
+        let backOnScreen: (Notification) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in self?.reconnectInterruptedCapture() }
+        }
+        DistributedNotificationCenter.default().addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main, using: backOnScreen)
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main, using: backOnScreen)
+        workspace.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main, using: backOnScreen)
     }
 
     func refreshPermissions() {
@@ -453,18 +461,55 @@ final class Coordinator: FrameSink, HUDModel {
     /// Frames and audio stop reaching the file; the finished recording has no gap.
     /// The pill's clock is fed from the recorder's, so the two cannot drift apart.
     func togglePause() {
-        guard case .recording(let session, var run) = activity else { return }
+        guard case .recording(let session, let run) = activity else { return }
         switch run.clock {
         case .running:
-            let elapsed = session.recorder.pause()
-            session.audio?.pause()
-            run.clock = .paused(total: elapsed)
+            pause(session, run)
         case .paused(let total):
-            let pausedFor = session.recorder.resume()
-            session.audio?.resume(pausedFor: pausedFor)
-            run.clock = .running(since: Date(), before: total)
+            guard session.recorder.isInterrupted else { return resume(session, run, from: total) }
+            // The stream has to come back before the clock may run again.
+            Task { await reconnectCapture(of: session.id, thenResume: true) }
         }
+    }
+
+    private func pause(_ session: RecordingSession, _ run: RecordingRun) {
+        var run = run
+        let elapsed = session.recorder.pause()
+        session.audio?.pause()
+        run.clock = .paused(total: elapsed)
         enter(.recording(session, run))
+    }
+
+    private func resume(_ session: RecordingSession, _ run: RecordingRun, from total: TimeInterval) {
+        var run = run
+        let pausedFor = session.recorder.resume()
+        session.audio?.resume(pausedFor: pausedFor)
+        run.clock = .running(since: Date(), before: total)
+        enter(.recording(session, run))
+    }
+
+    /// Locking the screen or sleeping the display ends the capture stream. The
+    /// recording waits, paused, on the same file, and a new stream picks it up once
+    /// the screen is back. Never retried in a loop: a stream started while the screen
+    /// is still locked would only be ended again.
+    private func reconnectCapture(of id: UUID, thenResume: Bool) async {
+        guard case .recording(let session, _) = activity, session.id == id else { return }
+        do {
+            try await session.recorder.reconnect()
+        } catch {
+            FileHandle.standardError.write(Data("[Screensnap] reconnect: \(error.localizedDescription)\n".utf8))
+            return
+        }
+        guard thenResume,
+              case .recording(let current, let run) = activity, current.id == id,
+              case .paused(let total) = run.clock,
+              !current.recorder.isInterrupted else { return }
+        resume(current, run, from: total)
+    }
+
+    private func reconnectInterruptedCapture() {
+        guard case .recording(let session, _) = activity, session.recorder.isInterrupted else { return }
+        Task { await reconnectCapture(of: session.id, thenResume: false) }
     }
 
     /// Switches the facecam bubble on or off for the rest of this recording.
@@ -890,9 +935,12 @@ final class Coordinator: FrameSink, HUDModel {
         }
     }
 
-    func sinkDidFail(with error: Error) {
-        guard case .recording(let session, _) = activity else { return }
-        Task { await abort(error, of: session.id) }
+    /// Pauses rather than ends the recording; see `reconnectCapture`. Stopping
+    /// while interrupted saves everything recorded up to the interruption.
+    func sinkWasInterrupted(by error: Error) {
+        guard case .recording(let session, let run) = activity else { return }
+        FileHandle.standardError.write(Data("[Screensnap] capture interrupted: \(error.localizedDescription)\n".utf8))
+        if case .running = run.clock { pause(session, run) }
     }
 
     // MARK: Library
