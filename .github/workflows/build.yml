@@ -10,7 +10,14 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Check GIF encoding and compression plans
+        run: Scripts/check-gif-stream.sh
+      - name: Check MP4 compression
+        run: Scripts/check-compression.sh
+      - name: Check original retention
+        run: Scripts/check-originals-archive.sh
       - name: Build app bundle
         run: Scripts/build-app.sh release

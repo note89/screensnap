@@ -2,50 +2,15 @@
 import Foundation
 import ImageIO
 
-/// Boxes a recording is scaled to fit inside; the number is the short edge of a
-/// landscape recording, the way people say "720p".
-enum ResolutionPreset: String, CaseIterable, Codable {
-    case p1080
-    case p720
-    case p540
-    case p480
-
-    var box: Dimensions {
-        switch self {
-        case .p1080: return Dimensions(width: 1920, height: 1080)
-        case .p720: return Dimensions(width: 1280, height: 720)
-        case .p540: return Dimensions(width: 960, height: 540)
-        case .p480: return Dimensions(width: 640, height: 480)
-        }
-    }
-
-    var label: String { String(rawValue.dropFirst()) + "p" }
-
-    fileprivate var exportPreset: String {
-        switch self {
-        case .p1080: return AVAssetExportPreset1920x1080
-        case .p720: return AVAssetExportPreset1280x720
-        case .p540: return AVAssetExportPreset960x540
-        case .p480: return AVAssetExportPreset640x480
-        }
-    }
-
-    /// Largest preset whose box does not enlarge `dimensions`; nil when the recording
-    /// is already smaller than every box.
-    static func largestNotEnlarging(_ dimensions: Dimensions) -> ResolutionPreset? {
-        allCases.first { dimensions.fitFactor(into: $0.box) < 1 }
-    }
-}
-
 enum CompressionTarget: Equatable {
-    case size(ByteCount)
+    case size(ByteCount, within: ResolutionCeiling)
     case fit(ResolutionPreset)
 
     static let sizePresets: [ByteCount] = [5, 10, 25, 100].map { ByteCount(Int64($0) * 1_000_000) }
 
     var label: String {
         switch self {
-        case .size(let bytes): return bytes.formatted
+        case .size(let bytes, _): return bytes.formatted
         case .fit(let preset): return preset.label
         }
     }
@@ -53,7 +18,7 @@ enum CompressionTarget: Equatable {
     /// Suffix for sibling files: `clip-720p.mp4`, `clip-10MB.gif`.
     fileprivate var fileSuffix: String {
         switch self {
-        case .size(let bytes): return "\(Int((Double(bytes.bytes) / 1_000_000).rounded()))MB"
+        case .size(let bytes, _): return "\(Int((Double(bytes.bytes) / 1_000_000).rounded()))MB"
         case .fit(let preset): return preset.label
         }
     }
@@ -99,13 +64,13 @@ enum CompressionError: LocalizedError {
 
 typealias ProgressHandler = @Sendable (Double) -> Void
 
-/// Re-encodes a recording to a smaller file. MP4 goes through `AVAssetExportSession`
-/// with a file-length cap; GIF is re-encoded frame by frame, shrinking and thinning
-/// frames until it fits.
+/// Re-encodes a recording to a smaller file. MP4 is re-encoded as HEVC at a bitrate
+/// worked out from the size limit; GIF is re-encoded frame by frame, shrinking and
+/// thinning frames until it fits.
 ///
 /// The result is built on the recording's own volume and moved into its folder by
 /// rename, so the folder holds a complete file at every step: the original until it
-/// is trashed, the result from before that. A crash or a quit part-way loses nothing
+/// is moved aside, the result from before that. A crash or a quit part-way loses nothing
 /// that was there.
 enum Compressor {
     static func compress(
@@ -113,6 +78,7 @@ enum Compressor {
         info: MediaInfo,
         to target: CompressionTarget,
         placement: CompressionPlacement,
+        originals: OriginalsRetention,
         progress: @escaping ProgressHandler
     ) async throws -> CompressionResult {
         let scratchFolder = try FileManager.default.url(
@@ -127,12 +93,12 @@ enum Compressor {
         case .gif: fit = try await compressGIF(recording.url, info: info, to: target, into: scratch, progress: progress)
         }
 
-        let destination = try place(scratch, for: recording, target: target, placement: placement)
+        let destination = try place(scratch, for: recording, target: target, placement: placement, originals: originals)
         let bytes = fileSize(destination)
         return CompressionResult(url: destination, bytes: bytes, fit: fit)
     }
 
-    private static func place(_ scratch: URL, for recording: Recording, target: CompressionTarget, placement: CompressionPlacement) throws -> URL {
+    private static func place(_ scratch: URL, for recording: Recording, target: CompressionTarget, placement: CompressionPlacement, originals: OriginalsRetention) throws -> URL {
         let folder = recording.url.deletingLastPathComponent()
         let pathExtension = recording.url.pathExtension
         switch placement {
@@ -142,17 +108,27 @@ enum Compressor {
             return destination
         case .replaceOriginal:
             // Into the folder first, under a stand-in name, so the original is only
-            // trashed once its replacement is already beside it.
+            // moved aside once its replacement is already beside it.
             let staged = FileManager.default.unusedURL(in: folder, stem: "\(recording.name)-compressing", pathExtension: pathExtension)
             try FileManager.default.moveItem(at: scratch, to: staged)
             do {
-                try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
+                try setAside(recording, originals: originals)
                 try FileManager.default.moveItem(at: staged, to: recording.url)
             } catch {
                 throw CompressionError.leftBeside(staged, reason: error.localizedDescription)
             }
             return recording.url
         }
+    }
+
+    /// Moves the file being replaced out of the library: into `Originals` for as long as
+    /// `originals` says, otherwise to the Trash.
+    private static func setAside(_ recording: Recording, originals: OriginalsRetention) throws {
+        guard originals != .discard else {
+            try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
+            return
+        }
+        try OriginalsArchive.retain(recording.url)
     }
 
     /// Asks the file system every time. `URL.resourceValues` caches on the URL, and off
@@ -165,64 +141,63 @@ enum Compressor {
 
     // MARK: MP4
 
-    /// Same bits-per-pixel budget the recorder uses, so a resolution-only compress
-    /// does not come out larger than the original.
-    private static func bitrateBudget(_ dimensions: Dimensions) -> Int64 {
-        max(600_000, Int64(dimensions.width) * Int64(dimensions.height) * 4)
-    }
+    /// Encodes tried per size-limit shrink. The first aims at the limit; the rest
+    /// correct the bitrate by how far the encoder landed from it.
+    private static let mp4Attempts = 4
 
     private static func compressMP4(_ url: URL, info: MediaInfo, to target: CompressionTarget, into scratch: URL, progress: @escaping ProgressHandler) async throws -> SizeFit {
         let asset = AVURLAsset(url: url)
-        let ladder: [ResolutionPreset]
-        let limit: Int64?
+        let duration = max(1, info.duration)
+        let framerate = max(1, Double(info.frameCount) / duration)
+
         switch target {
         case .fit(let preset):
-            ladder = [preset]
-            limit = nil
-        case .size(let bytes):
-            let start = ResolutionPreset.largestNotEnlarging(info.dimensions) ?? .p480
-            ladder = ResolutionPreset.allCases.drop { $0 != start }.map { $0 }
-            limit = bytes.bytes
-        }
+            let sourceBitsPerSecond = Double(fileSize(url).bytes) * 8 / duration
+            let budget = VideoPlanner.resizing(source: info.dimensions, sourceBitsPerSecond: sourceBitsPerSecond, to: preset)
+            try await HEVCTranscoder.transcode(asset, to: scratch, budget: budget, framerate: framerate, progress: progress)
+            return .met
 
-        for (step, preset) in ladder.enumerated() {
-            try? FileManager.default.removeItem(at: scratch)
-            let outDimensions = info.dimensions.fitted(into: preset.box)
-            let budgetBytes = bitrateBudget(outDimensions) * Int64(max(1, info.duration)) / 8
-            let cap = min(budgetBytes, limit.map { Int64(Double($0) * 0.97) } ?? .max)
-            try await export(asset, preset: preset.exportPreset, to: scratch, fileLengthLimit: cap) { fraction in
-                progress((Double(step) + fraction) / Double(ladder.count))
+        case .size(let limit, let ceiling):
+            let audioBytes = try await audioByteEstimate(asset, duration: duration)
+            let plan = VideoPlanner.fitting(
+                limitBytes: limit.bytes, audioBytes: audioBytes, duration: duration,
+                framerate: framerate, source: info.dimensions, ceiling: ceiling
+            )
+            let ladder = VideoPlanner.frameSizes(from: info.dimensions, ceiling: ceiling)
+            var rung = ladder.firstIndex(of: plan.dimensions) ?? 0
+            var bitsPerSecond = Double(plan.bitsPerSecond)
+
+            for attempt in 0..<mp4Attempts {
+                try? FileManager.default.removeItem(at: scratch)
+                let budget = VideoBudget(dimensions: ladder[rung], bitsPerSecond: Int(bitsPerSecond))
+                try await HEVCTranscoder.transcode(asset, to: scratch, budget: budget, framerate: framerate) { fraction in
+                    progress(attemptProgress(attempt, fraction))
+                }
+                let bytes = fileSize(scratch).bytes
+                if bytes <= limit.bytes { return .met }
+                if attempt == mp4Attempts - 1 { break }
+
+                // Over: ask for fewer bits in proportion to the overshoot, and move to a
+                // smaller frame if that leaves the current one starved.
+                bitsPerSecond *= Double(limit.bytes) * VideoPlanner.aimAtFractionOfLimit / Double(bytes)
+                if rung < ladder.count - 1, VideoPlanner.isStarved(ladder[rung], bitsPerSecond: bitsPerSecond, framerate: framerate) {
+                    rung += 1
+                }
             }
-            let bytes = fileSize(scratch).bytes
-            if let limit, bytes > limit, step < ladder.count - 1 { continue }
-            return limit.map { bytes <= $0 ? .met : .exceeded } ?? .met
+            return .exceeded
         }
-        throw CompressionError.exportFailed("no export presets available")
     }
 
-    private static func export(_ asset: AVURLAsset, preset: String, to url: URL, fileLengthLimit: Int64, progress: @escaping ProgressHandler) async throws {
-        guard let session = AVAssetExportSession(asset: asset, presetName: preset) else {
-            throw CompressionError.exportUnavailable
-        }
-        session.outputURL = url
-        session.outputFileType = .mp4
-        session.shouldOptimizeForNetworkUse = true
-        session.fileLengthLimit = fileLengthLimit
+    /// The first encode takes most of the bar; retries share the rest.
+    private static func attemptProgress(_ attempt: Int, _ fraction: Double) -> Double {
+        attempt == 0 ? fraction * 0.7 : 0.7 + (Double(attempt - 1) + fraction) / Double(mp4Attempts - 1) * 0.3
+    }
 
-        let poller = Task {
-            while !Task.isCancelled {
-                progress(Double(session.progress))
-                try? await Task.sleep(for: .milliseconds(200))
-            }
-        }
-        defer { poller.cancel() }
-
-        await session.export()
-        switch session.status {
-        case .completed: return
-        case .cancelled: throw CancellationError()
-        default: throw CompressionError.exportFailed(session.error?.localizedDescription ?? "unknown")
-        }
+    /// The audio is copied as is, so its size is the source's: bitrate times length.
+    private static func audioByteEstimate(_ asset: AVURLAsset, duration: TimeInterval) async throws -> Int64 {
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else { return 0 }
+        let bitsPerSecond = try await track.load(.estimatedDataRate)
+        return Int64(Double(bitsPerSecond) * duration / 8)
     }
 
     // MARK: GIF
@@ -247,7 +222,7 @@ enum Compressor {
         case .fit(let preset):
             attempts = [GIFAttempt(scale: info.dimensions.fitFactor(into: preset.box), stride: 1)]
             limit = nil
-        case .size(let bytes):
+        case .size(let bytes, _):
             attempts = [
                 GIFAttempt(scale: 0.75, stride: 1),
                 GIFAttempt(scale: 0.5, stride: 1),
@@ -303,18 +278,6 @@ enum Compressor {
         } catch GIFStreamError.noFrames {
             throw CompressionError.unreadable
         }
-    }
-}
-
-extension Dimensions {
-    /// Factor that fits these dimensions inside `box`; ≥ 1 means it already fits.
-    func fitFactor(into box: Dimensions) -> Double {
-        min(Double(box.width) / Double(width), Double(box.height) / Double(height))
-    }
-
-    func fitted(into box: Dimensions) -> Dimensions {
-        let factor = fitFactor(into: box)
-        return factor < 1 ? scaled(by: factor) : self
     }
 }
 

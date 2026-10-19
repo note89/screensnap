@@ -10,7 +10,8 @@ set -euo pipefail
 CONFIG="${1:-debug}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="$ROOT/.build/$([[ $CONFIG == release ]] && echo release || echo debug)"
-APP_DIR="$ROOT/build/Screensnap.app"
+# A release can be assembled separately while the normal development app is running.
+APP_DIR="${SCREENSNAP_BUILD_DIR:-$ROOT/build}/Screensnap.app"
 
 echo "→ swift build (-c $CONFIG)"
 cd "$ROOT"

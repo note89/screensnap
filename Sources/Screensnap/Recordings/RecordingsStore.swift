@@ -168,6 +168,11 @@ final class RecordingsStore {
         rescan()
     }
 
+    /// Expires only originals that Screensnap itself archived.
+    func pruneOriginals(keeping retention: OriginalsRetention, now: Date = Date()) {
+        OriginalsArchive.prune(in: folder, keeping: retention, now: now)
+    }
+
     private func ensureFolderExists() {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     }

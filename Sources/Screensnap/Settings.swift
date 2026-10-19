@@ -92,6 +92,8 @@ final class Settings {
         static let captureMode = "recording.captureMode"
         static let facecam = "recording.facecam"
         static let sizeLimitBytes = "recording.sizeLimitBytes"
+        static let sizeLimitResolution = "recording.sizeLimitResolution"
+        static let originalsKeepDays = "recording.originalsKeepDays"
         static let revealInFinder = "interface.revealInFinder"
         /// Legacy on/off switch, read once to seed `clipboardCopy`.
         static let copyToClipboard = "interface.copyToClipboard"
@@ -127,6 +129,8 @@ final class Settings {
             }
         }
     }
+    var sizeLimitResolution: ResolutionCeiling { didSet { defaults.set(sizeLimitResolution.rawValue, forKey: Key.sizeLimitResolution) } }
+    var originalsRetention: OriginalsRetention { didSet { defaults.set(originalsRetention.rawValue, forKey: Key.originalsKeepDays) } }
     var delivery: Delivery {
         didSet {
             defaults.set(delivery.clipboard.rawValue, forKey: Key.clipboardCopy)
@@ -149,6 +153,7 @@ final class Settings {
             Key.captureCursor: true,
             Key.revealInFinder: false,
             Key.sizeLimitBytes: 100_000_000,
+            Key.originalsKeepDays: OriginalsRetention.month.rawValue,
         ])
         gifFramerate = Framerate(clamping: defaults.object(forKey: Key.gifFramerate) as? Int ?? defaults.integer(forKey: Key.framerate))
         mp4Framerate = Framerate(clamping: defaults.integer(forKey: Key.mp4Framerate))
@@ -160,6 +165,8 @@ final class Settings {
         captureMode = CaptureMode(rawValue: defaults.string(forKey: Key.captureMode) ?? "") ?? .region
         facecam = Facecam(rawValue: defaults.string(forKey: Key.facecam) ?? "") ?? .off
         sizeLimit = SizeLimit.Ceiling(bytes: Int64(defaults.integer(forKey: Key.sizeLimitBytes))).map(SizeLimit.atMost) ?? .none
+        sizeLimitResolution = ResolutionCeiling(rawValue: defaults.string(forKey: Key.sizeLimitResolution) ?? "") ?? .best
+        originalsRetention = OriginalsRetention(rawValue: defaults.integer(forKey: Key.originalsKeepDays)) ?? .month
         delivery = Delivery(
             clipboard: ClipboardCopy(rawValue: defaults.string(forKey: Key.clipboardCopy) ?? "")
                 ?? (defaults.object(forKey: Key.copyToClipboard) as? Bool == false ? .never : .gifsOnly),

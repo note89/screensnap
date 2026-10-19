@@ -100,7 +100,7 @@ Open the app (menu bar → **Open Screensnap…**) and go to **Output**.
 | **GIF · best** | no | Same GIF, encoded by [gifski](https://gif.ski) for smoother colour and smaller files. Releases bundle gifski; a build without it says so on the card. |
 | **MP4** | optional | H.264, roughly a tenth of the size of a GIF. The only format that can carry your voice. |
 
-**Size limit** is where Screensnap earns its keep. Choose a preset — 8 MB (Discord free), 25 MB (Gmail, Slack), 100 MB (Signal) — or type your own. A recording that lands over the limit is shrunk right after encoding (smaller frame first, then fewer frames) until it fits, and the pill reports the final size. If it cannot get under the limit it says so instead of guessing.
+**Size limit** is where Screensnap earns its keep. Choose a preset — 8 MB (Discord free), 25 MB (Gmail, Slack), 100 MB (Signal) — or type your own. A recording that lands over the limit is shrunk right after encoding until it fits, and the pill reports the final size. An MP4 is re-encoded as HEVC at a bitrate worked out from the limit, keeping the sharpest frame that limit pays for (a 10-minute Retina recording fits 100 MB at about 1440p); **MP4 frame size** can cap that at 1080p or 720p. A GIF gets a smaller frame, then fewer frames. The raw recording is moved to an `Originals` folder inside your recordings folder and deleted after 30 days (7, 90, or straight to the Trash, your choice). If it cannot get under the limit it says so instead of guessing.
 
 ## The recordings library
 
@@ -112,7 +112,7 @@ Every clip is saved to one folder — `~/Movies/Screensnap` by default — and t
 
 Each row shows a thumbnail, dimensions, duration, size, and date, and has four actions: **Copy** (to the clipboard), **Show** (in Finder), **Compress…**, and **Trash**. Double-click a name to rename it.
 
-**Compress…** opens a small popover: pick a target — a size such as *10 MB* or a resolution such as *720p* — and whether to **keep both** files (the copy is named `original-10MB.mp4`) or **replace the original** (the original goes to the Trash, so it is recoverable).
+**Compress…** opens a small popover: pick a target — a size such as *10 MB* or a resolution such as *720p* — and whether to **keep both** files (the copy is named `original-10MB.mp4`) or **replace the original** (the original is kept in `Originals` for the period set in Output settings, so it is recoverable).
 
 <p align="center">
   <img src="docs/compress.png" width="360" alt="Compress popover with size and resolution targets">
@@ -186,6 +186,8 @@ Sources/Screensnap/
   Recordings/Recording.swift Recording, MediaInfo, Thumbnail, Clipboard
   Recordings/RecordingsStore.swift  The library: folder scan + file watcher
   Recordings/Compressor.swift       Compress to a size or a resolution
+  Recordings/CompressionPlan.swift  Frame size and bitrate for a size limit
+  Recordings/HEVCTranscoder.swift   HEVC re-encode at a chosen bitrate, audio copied
   Updater.swift              GitHub Releases check, download, swap, relaunch
   Permissions.swift          TCC checks, System Settings deep links, Relaunch
   GrantPanel.swift           Drag-to-grant tile that follows System Settings
@@ -207,6 +209,8 @@ Releases are built on the Mac that holds the Developer ID key, which never leave
 ```
 
 The script stamps the version into `Info.plist`, signs `Screensnap.app` with the hardened runtime and a secure timestamp, has Apple notarize it, staples the ticket, zips it as `build/Screensnap-0.3.0.zip`, and with `--publish` tags the commit, uploads the zip with generated notes, and sets the new version and SHA-256 in [`note89/homebrew-tap`](https://github.com/note89/homebrew-tap)'s `Casks/screensnap.rb`. `--publish` checks up front that it can read that cask. Running apps pick it up on their next daily check. Tag pushes no longer build anything in CI, so a release cannot go out unsigned.
+
+If the development app in `build/` is running, set `SCREENSNAP_BUILD_DIR="$PWD/build/release"` when invoking the release script to keep its bundle intact.
 
 ## License
 

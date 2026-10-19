@@ -273,5 +273,35 @@ do {
     check(templateError(".%Y") == .stem(.startsWithDot), "a template starting with a dot is refused")
 }
 
+// MARK: - Compression plan
+
+do {
+    // The 10-minute 3024x1964 recording that came out 640x416: 100 MB must now keep a
+    // frame near 1440p, and 25 MB a mid-size one.
+    let retina = Dimensions(width: 3024, height: 1964)
+    let hundred = VideoPlanner.fitting(limitBytes: 100_000_000, audioBytes: 5_000_000, duration: 612, framerate: 26.6, source: retina, ceiling: .best)
+    check(hundred.dimensions.shortEdge >= 1080, "100 MB over ten minutes keeps at least 1080p", hundred.dimensions.label)
+    check(Double(hundred.bitsPerSecond) * 612 / 8 + 5_000_000 <= 100_000_000, "the bitrate budget stays under the limit")
+
+    let capped = VideoPlanner.fitting(limitBytes: 100_000_000, audioBytes: 5_000_000, duration: 612, framerate: 26.6, source: retina, ceiling: .p720)
+    check(capped.dimensions.shortEdge <= 720, "a 720p ceiling holds even when the limit pays for more", capped.dimensions.label)
+
+    let tight = VideoPlanner.fitting(limitBytes: 25_000_000, audioBytes: 5_000_000, duration: 612, framerate: 26.6, source: retina, ceiling: .best)
+    check(tight.dimensions.shortEdge < hundred.dimensions.shortEdge, "a tighter limit picks a smaller frame", tight.dimensions.label)
+
+    let short = Dimensions(width: 800, height: 600)
+    check(VideoPlanner.frameSizes(from: short, ceiling: .best).first == short, "a small recording is never enlarged")
+    check(VideoPlanner.frameSizes(from: retina, ceiling: .best).map(\.width).allSatisfy { $0 % 2 == 0 }, "every frame size has even dimensions")
+    let ladder = VideoPlanner.frameSizes(from: retina, ceiling: .best)
+    check(zip(ladder, ladder.dropFirst()).allSatisfy { $0.width * $0.height > $1.width * $1.height }, "the ladder only gets smaller")
+
+    let audioOverruns = VideoPlanner.fitting(limitBytes: 1_000_000, audioBytes: 5_000_000, duration: 60, framerate: 30, source: retina, ceiling: .best)
+    check(audioOverruns.bitsPerSecond > 0, "a limit the audio overruns still gets a plan")
+
+    let resized = VideoPlanner.resizing(source: retina, sourceBitsPerSecond: 6_500_000, to: .p720)
+    check(resized.dimensions.shortEdge == 720 || resized.dimensions.shortEdge == 718, "resizing lands on the requested short edge", resized.dimensions.label)
+    check(resized.bitsPerSecond < 6_500_000, "resizing asks for fewer bits than the source")
+}
+
 print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check(s) failed.")
 exit(failures == 0 ? 0 : 1)
