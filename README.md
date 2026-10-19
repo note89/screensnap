@@ -210,6 +210,8 @@ Releases are built on the Mac that holds the Developer ID key, which never leave
 
 The script stamps the version into `Info.plist`, signs `Screensnap.app` with the hardened runtime and a secure timestamp, has Apple notarize it, staples the ticket, zips it as `build/Screensnap-0.3.0.zip`, and with `--publish` tags the commit, uploads the zip with generated notes, and sets the new version and SHA-256 in [`note89/homebrew-tap`](https://github.com/note89/homebrew-tap)'s `Casks/screensnap.rb`. `--publish` checks up front that it can read that cask. Running apps pick it up on their next daily check. Tag pushes no longer build anything in CI, so a release cannot go out unsigned.
 
+If the development app in `build/` is running, set `SCREENSNAP_BUILD_DIR="$PWD/build/release"` when invoking the release script to keep its bundle intact.
+
 ## License
 
 MIT

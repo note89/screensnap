@@ -24,8 +24,9 @@ PUBLISH="${2:-}"
 [[ -z $PUBLISH || $PUBLISH == --publish ]] || { echo "unknown option: $PUBLISH" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$ROOT/build/Screensnap.app"
-ZIP="$ROOT/build/Screensnap-$VERSION.zip"
+BUILD_DIR="${SCREENSNAP_BUILD_DIR:-$ROOT/build}"
+APP="$BUILD_DIR/Screensnap.app"
+ZIP="$BUILD_DIR/Screensnap-$VERSION.zip"
 TAG="v$VERSION"
 cd "$ROOT"
 
@@ -45,7 +46,7 @@ step "Building gifski"
 Scripts/build-gifski.sh
 
 step "Building"
-SCREENSNAP_SIGN_IDENTITY="$IDENTITY" Scripts/build-app.sh release
+SCREENSNAP_BUILD_DIR="$BUILD_DIR" SCREENSNAP_SIGN_IDENTITY="$IDENTITY" Scripts/build-app.sh release
 [[ -x "$APP/Contents/Resources/gifski" ]] || die "gifski is missing from the bundle; GIF · best would fall back to the fast encoder"
 
 step "Stamping version $VERSION"
@@ -60,7 +61,7 @@ codesign --force --options runtime --timestamp --entitlements Resources/Screensn
 codesign --verify --strict --deep --verbose=2 "$APP"
 
 step "Notarizing (usually 1–5 minutes)"
-SUBMISSION="$ROOT/build/Screensnap-$VERSION-notarize.zip"
+SUBMISSION="$BUILD_DIR/Screensnap-$VERSION-notarize.zip"
 ditto -c -k --keepParent "$APP" "$SUBMISSION"
 RESULT="$(mktemp)"
 xcrun notarytool submit "$SUBMISSION" --keychain-profile "$NOTARY_PROFILE" --wait --output-format json >"$RESULT" || true
