@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile and run the checks in Tests/GIFStreamChecks: the GIF stream, the frame
-# diff, and the file-name types. They need only the Command Line Tools, unlike
+# diff, the file-name types, and the MP4 compression plan. They need only the Command Line Tools, unlike
 # `swift test`, which needs Xcode for XCTest.
 #
 #   ./Scripts/check-gif-stream.sh
@@ -16,5 +16,6 @@ swiftc -o "$WORK/checks" \
     "$ROOT/Sources/Screensnap/GIFStream.swift" \
     "$ROOT/Sources/Screensnap/FrameDiff.swift" \
     "$ROOT/Sources/Screensnap/FilenameTemplate.swift" \
+    "$ROOT/Sources/Screensnap/Recordings/CompressionPlan.swift" \
     "$ROOT/Tests/GIFStreamChecks/main.swift"
 "$WORK/checks" "$WORK"

@@ -367,8 +367,29 @@ private struct OutputPane: View {
                     }
                 }
             }
-            Text("Record as long as you like. If the file comes out bigger, it is shrunk right after you finish — smaller frame, then fewer frames — until it fits. You see the final size in the pill.")
+            Text("Record as long as you like. If the file comes out bigger, it is shrunk right after you finish until it fits: MP4 is re-encoded as HEVC with the sharpest frame the limit pays for, GIF gets a smaller frame, then fewer frames. You see the final size in the pill.")
                 .font(.caption).foregroundStyle(.secondary)
+
+            if settings.sizeLimit != .none {
+                LabeledContent("MP4 frame size") {
+                    Picker("", selection: $settings.sizeLimitResolution) {
+                        ForEach(ResolutionCeiling.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 180)
+                }
+                LabeledContent("The raw recording") {
+                    Picker("", selection: $settings.originalsRetention) {
+                        ForEach(OriginalsRetention.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 180)
+                }
+                Text(settings.originalsRetention == .discard
+                    ? "The recording as captured goes to the Trash once it has been shrunk."
+                    : "The recording as captured is kept in an Originals folder inside your recordings folder, then deleted after the period you pick.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .onAppear {
             coordinator.refreshGifski()
@@ -781,7 +802,7 @@ private struct CompressPopover: View {
             SectionLabel("TO A SIZE")
             HStack {
                 ForEach(CompressionTarget.sizePresets, id: \.bytes) { size in
-                    choice(.size(size))
+                    choice(.size(size, within: .best))
                 }
             }
             SectionLabel("TO A RESOLUTION")
@@ -797,7 +818,7 @@ private struct CompressPopover: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            Text(placement == .sibling ? "A new file next to the original, named after the target." : "The original goes to the Trash.")
+            Text(placement == .sibling ? "A new file next to the original, named after the target." : "The original is set aside; Output settings say for how long.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Spacer()

@@ -196,6 +196,7 @@ final class Coordinator: FrameSink, HUDModel {
             FileHandle.standardError.write(Data("[Screensnap] start: could not register \(hotkey.keys)\n".utf8))
         }
         updater.checkIfDue(settings: settings)
+        library.pruneOriginals(keeping: settings.originalsRetention)
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshPermissions()
@@ -854,7 +855,7 @@ final class Coordinator: FrameSink, HUDModel {
     private func fit(_ recording: Recording, under limit: ByteCount) async -> (recording: Recording, outcome: FitOutcome) {
         guard compression == nil else { return (recording, .skipped(limit)) }
         enter(.finishing(.fittingToLimit(limit)))
-        let job = CompressionJob(recording: recording, target: .size(limit), placement: .replaceOriginal, origin: .sizeLimit, progress: 0)
+        let job = CompressionJob(recording: recording, target: .size(limit, within: settings.sizeLimitResolution), placement: .replaceOriginal, origin: .sizeLimit, progress: 0)
         do {
             let result = try await run(job)
             guard let fitted = library.recording(at: result.url) ?? Recording(url: result.url) else {
@@ -981,7 +982,7 @@ final class Coordinator: FrameSink, HUDModel {
             releasePendingQuitIfSafe()
         }
         guard let info = await library.loadInfo(for: job.recording) else { throw CompressionError.unreadable }
-        let result = try await Compressor.compress(job.recording, info: info, to: job.target, placement: job.placement) { [weak self] progress in
+        let result = try await Compressor.compress(job.recording, info: info, to: job.target, placement: job.placement, originals: settings.originalsRetention) { [weak self] progress in
             Task { @MainActor [weak self] in
                 // A late update from a finished job must not move another job's bar.
                 guard self?.compression?.recording == job.recording else { return }
