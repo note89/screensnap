@@ -179,6 +179,7 @@ final class Coordinator: FrameSink, HUDModel {
     /// Where the facecam bubble was last left, so a restart or switching the camera
     /// back on puts it there instead of the corner.
     @ObservationIgnored private var lastBubbleFrame: CGRect?
+    @ObservationIgnored private var originalsPruningTask: Task<Void, Never>?
 
     init() {
         permissionsAtLaunch = Permissions.check()
@@ -196,11 +197,20 @@ final class Coordinator: FrameSink, HUDModel {
             FileHandle.standardError.write(Data("[Screensnap] start: could not register \(hotkey.keys)\n".utf8))
         }
         updater.checkIfDue(settings: settings)
-        library.pruneOriginals(keeping: settings.originalsRetention)
+        pruneOriginals()
+        originalsPruningTask?.cancel()
+        originalsPruningTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(86_400)) } catch { return }
+                guard self != nil else { return }
+                self?.pruneOriginals()
+            }
+        }
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshPermissions()
                 self?.refreshGifski()
+                self?.pruneOriginals()
             }
         }
         // Each of these can follow the capture stream being ended by the system.
@@ -959,6 +969,14 @@ final class Coordinator: FrameSink, HUDModel {
 
     func setSaveFolder(_ url: URL) {
         library.setFolder(url)
+        pruneOriginals()
+    }
+
+    /// Recheck on launch, activation, folder changes and daily while the menu-bar
+    /// app stays open. An active compression owns its files until it completes.
+    private func pruneOriginals() {
+        guard compression == nil else { return }
+        library.pruneOriginals(keeping: settings.originalsRetention)
     }
 
     func compress(_ recording: Recording, to target: CompressionTarget, placement: CompressionPlacement) async -> CompressionOutcome {
@@ -990,6 +1008,7 @@ final class Coordinator: FrameSink, HUDModel {
             }
         }
         library.rescan()
+        OriginalsArchive.prune(in: job.recording.url.deletingLastPathComponent(), keeping: settings.originalsRetention)
         return result
     }
 }

@@ -6,6 +6,7 @@ import Foundation
 /// bitrate, which for a screen recording is several times what the picture needs.
 enum HEVCTranscoder {
     static func transcode(_ asset: AVURLAsset, to url: URL, budget: VideoBudget, framerate: Double, progress: @escaping ProgressHandler) async throws {
+        try Task.checkCancellation()
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else { throw CompressionError.unreadable }
         let audioTrack = try await asset.loadTracks(withMediaType: .audio).first
         let duration = max(0.001, CMTimeGetSeconds(try await asset.load(.duration)))
@@ -43,61 +44,75 @@ enum HEVCTranscoder {
             let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
             let hint = try await audioTrack.load(.formatDescriptions).first
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: hint)
-            if reader.canAdd(output), writer.canAdd(input) {
-                reader.add(output)
-                writer.add(input)
-                audio = (output, input)
-            }
+            guard reader.canAdd(output), writer.canAdd(input) else { throw CompressionError.exportUnavailable }
+            reader.add(output)
+            writer.add(input)
+            audio = (output, input)
         }
 
+        // Cancel only after all pumps have stopped. Cancelling the writer from a
+        // separate cancellation handler can race input registration or append and
+        // raise an Objective-C exception instead of throwing CancellationError.
+        defer {
+            if reader.status == .reading { reader.cancelReading() }
+            if writer.status == .writing { writer.cancelWriting() }
+        }
         guard reader.startReading() else { throw CompressionError.exportFailed(reader.error?.localizedDescription ?? "could not read the recording") }
         guard writer.startWriting() else { throw CompressionError.exportFailed(writer.error?.localizedDescription ?? "could not start writing") }
         writer.startSession(atSourceTime: .zero)
 
-        await withTaskCancellationHandler {
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    await pump(videoOutput, into: videoInput) { sample in
-                        progress(min(1, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample)) / duration))
-                    }
-                }
-                if let audio {
-                    group.addTask { await pump(audio.output, into: audio.input, onSample: nil) }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await pump(videoOutput, into: videoInput, reader: reader, writer: writer) { sample in
+                    progress(min(1, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample)) / duration))
                 }
             }
-        } onCancel: {
-            reader.cancelReading()
-            writer.cancelWriting()
+            if let audio {
+                group.addTask { try await pump(audio.output, into: audio.input, reader: reader, writer: writer, onSample: nil) }
+            }
+            try await group.waitForAll()
         }
         try Task.checkCancellation()
-
+        // A nil sample means either end-of-stream or a read/decode failure. A
+        // writer can successfully finish the partial samples in the latter case;
+        // never let that partial file replace the original recording.
+        guard reader.status == .completed else {
+            throw CompressionError.exportFailed(reader.error?.localizedDescription ?? "could not read the complete recording")
+        }
         await writer.finishWriting()
+        try Task.checkCancellation()
         guard writer.status == .completed else {
-            throw CompressionError.exportFailed((writer.error ?? reader.error)?.localizedDescription ?? "unknown")
+            throw CompressionError.exportFailed(writer.error?.localizedDescription ?? "could not finish writing")
         }
     }
 
-    /// Feeds samples from `output` into `input` as the writer asks for them, until the
-    /// reader runs dry or the writer stops accepting. Why it stopped is read off the
-    /// reader and writer afterwards.
-    private static func pump(_ output: AVAssetReaderOutput, into input: AVAssetWriterInput, onSample: (@Sendable (CMSampleBuffer) -> Void)?) async {
-        await withCheckedContinuation { (finished: CheckedContinuation<Void, Never>) in
-            let queue = DispatchQueue(label: "screensnap.transcode.\(input.mediaType.rawValue)")
-            input.requestMediaDataWhenReady(on: queue) {
-                while input.isReadyForMoreMediaData {
-                    guard let sample = output.copyNextSampleBuffer() else {
-                        input.markAsFinished()
-                        finished.resume()
-                        return
-                    }
-                    onSample?(sample)
-                    guard input.append(sample) else {
-                        input.markAsFinished()
-                        finished.resume()
-                        return
-                    }
-                }
+    /// Each pump owns one input. While backpressured it yields briefly, checking
+    /// terminal states and task cancellation instead of waiting indefinitely for a
+    /// readiness callback that a failed/cancelled writer will never deliver.
+    private static func pump(_ output: AVAssetReaderOutput, into input: AVAssetWriterInput, reader: AVAssetReader, writer: AVAssetWriter, onSample: (@Sendable (CMSampleBuffer) -> Void)?) async throws {
+        while true {
+            try Task.checkCancellation()
+            guard reader.status != .failed else {
+                throw CompressionError.exportFailed(reader.error?.localizedDescription ?? "could not read the complete recording")
             }
+            guard writer.status == .writing else {
+                throw CompressionError.exportFailed(writer.error?.localizedDescription ?? "could not write the recording")
+            }
+            guard input.isReadyForMoreMediaData else {
+                try await Task.sleep(for: .milliseconds(2))
+                continue
+            }
+            guard let sample = output.copyNextSampleBuffer() else {
+                guard reader.status != .failed else {
+                    throw CompressionError.exportFailed(reader.error?.localizedDescription ?? "could not read the complete recording")
+                }
+                input.markAsFinished()
+                return
+            }
+            guard input.append(sample) else {
+                throw CompressionError.exportFailed(writer.error?.localizedDescription ?? "could not write a sample")
+            }
+            onSample?(sample)
         }
     }
 }

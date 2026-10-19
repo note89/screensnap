@@ -378,18 +378,18 @@ private struct OutputPane: View {
                     .labelsHidden()
                     .frame(width: 180)
                 }
-                LabeledContent("The raw recording") {
-                    Picker("", selection: $settings.originalsRetention) {
-                        ForEach(OriginalsRetention.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }
-                    .labelsHidden()
-                    .frame(width: 180)
-                }
-                Text(settings.originalsRetention == .discard
-                    ? "The recording as captured goes to the Trash once it has been shrunk."
-                    : "The recording as captured is kept in an Originals folder inside your recordings folder, then deleted after the period you pick.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
+            LabeledContent("Replaced originals") {
+                Picker("", selection: $settings.originalsRetention) {
+                    ForEach(OriginalsRetention.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .labelsHidden()
+                .frame(width: 180)
+            }
+            Text(settings.originalsRetention == .discard
+                ? "When compression replaces a recording, the original goes to the Trash."
+                : "When compression replaces a recording, the original is kept in an Originals folder, then deleted after the period you pick. This also applies to Compress in the library.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .onAppear {
             coordinator.refreshGifski()

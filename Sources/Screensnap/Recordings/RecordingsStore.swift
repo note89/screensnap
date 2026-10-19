@@ -168,21 +168,9 @@ final class RecordingsStore {
         rescan()
     }
 
-    /// Deletes files that have sat in `Originals` longer than `retention` allows. The
-    /// age is from when the file was moved in, not when it was recorded: a recording
-    /// compressed months later still gets its full window. `.discard` leaves whatever
-    /// is there alone.
+    /// Expires only originals that Screensnap itself archived.
     func pruneOriginals(keeping retention: OriginalsRetention, now: Date = Date()) {
-        guard retention != .discard else { return }
-        let folder = folder.appendingPathComponent(OriginalsRetention.folderName, isDirectory: true)
-        let keys: [URLResourceKey] = [.addedToDirectoryDateKey, .contentModificationDateKey]
-        let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
-        let cutoff = now.addingTimeInterval(-Double(retention.rawValue) * 86_400)
-        for file in files where OutputContainer(rawValue: file.pathExtension.lowercased()) != nil {
-            let values = try? file.resourceValues(forKeys: Set(keys))
-            guard let movedIn = values?.addedToDirectoryDate ?? values?.contentModificationDate, movedIn < cutoff else { continue }
-            try? FileManager.default.removeItem(at: file)
-        }
+        OriginalsArchive.prune(in: folder, keeping: retention, now: now)
     }
 
     private func ensureFolderExists() {

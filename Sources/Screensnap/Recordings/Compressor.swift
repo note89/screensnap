@@ -24,28 +24,6 @@ enum CompressionTarget: Equatable {
     }
 }
 
-/// How long the file a compression replaced stays recoverable. Compressing is lossy
-/// and often runs unattended, right after a recording, so the raw file is moved
-/// aside rather than thrown away.
-enum OriginalsRetention: Int, CaseIterable {
-    case discard = 0
-    case week = 7
-    case month = 30
-    case quarter = 90
-
-    var label: String {
-        switch self {
-        case .discard: return "Move to the Trash"
-        case .week: return "Keep for 7 days"
-        case .month: return "Keep for 30 days"
-        case .quarter: return "Keep for 90 days"
-        }
-    }
-
-    /// Subfolder of the recordings folder the replaced files are moved into.
-    static let folderName = "Originals"
-}
-
 enum CompressionPlacement: Equatable {
     case replaceOriginal
     case sibling
@@ -150,10 +128,7 @@ enum Compressor {
             try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
             return
         }
-        let folder = recording.url.deletingLastPathComponent().appendingPathComponent(OriginalsRetention.folderName, isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let destination = FileManager.default.unusedURL(in: folder, stem: recording.name, pathExtension: recording.url.pathExtension)
-        try FileManager.default.moveItem(at: recording.url, to: destination)
+        try OriginalsArchive.retain(recording.url)
     }
 
     /// Asks the file system every time. `URL.resourceValues` caches on the URL, and off
